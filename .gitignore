@@ -1,0 +1,7 @@
+/.cursorignore
+/IAM_output_film
+/IAM_output_nofilm
+/__pycache__
+/data
+/mnist_handwriting_output
+/trainin_log.log
