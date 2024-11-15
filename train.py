@@ -14,23 +14,15 @@ import torchvision.transforms as transforms
 from PIL import ImageDraw, ImageFont
 import time
 
-def generate_samples(config, epoch, model, noise_scheduler, batch_size=5):
+def generate_samples(config, epoch, model, batch_size=5):
     """
-    글리프 이미지와 writer ID를 기반으로 손글씨 이미지를 생성합니다.
-    
-    Args:
-        config (IAMTrainingConfig): 설정 객체
-        epoch (int): 현재 에폭
-        model (GC_DDPM): 학습된 모델
-        noise_scheduler: 노이즈 스케줄러
-        batch_size (int): 한 번에 생성할 이미지 수
+    수정된 GC_DDPM 모델을 사용하여 샘플을 생성합니다.
     """
     model.eval()
     
     # 글리프 이미지와 writer ID 준비
     transform = transforms.Compose([
         transforms.ToTensor(),
-        transforms.Lambda(lambda x: 2.0 * x - 1.0)  # [0,1] -> [-1,1] 범위로 변환
     ])
     
     # writer IDs 로드
@@ -57,43 +49,27 @@ def generate_samples(config, epoch, model, noise_scheduler, batch_size=5):
     glyph_images = torch.stack(glyph_images).to(config.device)
     writer_ids_tensor = torch.tensor(selected_writer_ids, dtype=torch.long).to(config.device)
     
+    # 수정된 모델의 sample 메소드 사용
     with torch.no_grad():
-        # 노이즈 생성
-        noise = torch.randn(
-            batch_size,
-            1,
-            config.image_size,
-            config.max_width
-        ).to(config.device)
-        
-        # 샘플링
-        sample = noise
-        for t in tqdm(noise_scheduler.timesteps):
-            noise_pred, _ = model(
-                sample,
-                glyph_images,
-                t,
-                writer_ids_tensor,
-                use_guidance=True,
-                content_scale=3.0,
-                style_scale=1.0
-            )
-            sample = noise_scheduler.step(noise_pred, t, sample).prev_sample
+        samples = model.sample(
+            glyph=glyph_images,
+            writer_ids=writer_ids_tensor,
+            use_guidance=True,
+            content_scale=3.0,
+            style_scale=1.0
+        )
     
     # 결과 이미지 생성
-    samples = []
+    samples_np = []
     for i in range(batch_size):
-        # 글리프 이미지와 생성된 이미지를 나란히 배치
-        glyph = ((glyph_images[i].cpu().numpy() + 1) * 127.5).clip(0, 255).astype(np.uint8)
-        generated = ((sample[i].cpu().numpy() + 1) * 127.5).clip(0, 255).astype(np.uint8)
+        glyph = (glyph_images[i].cpu().numpy() * 255).astype(np.uint8)
+        generated = (samples[i].cpu().numpy() * 255).astype(np.uint8)
         
         combined = np.concatenate([glyph[0], generated[0]], axis=1)
-        samples.append(combined)
+        samples_np.append(combined)
     
-    # 모든 샘플을 세로로 쌓기
-    final_image = np.concatenate(samples, axis=0)
+    final_image = np.concatenate(samples_np, axis=0)
     
-    # 결과 저장
     os.makedirs(os.path.join(config.output_dir, 'samples'), exist_ok=True)
     Image.fromarray(final_image).save(
         os.path.join(config.output_dir, 'samples', f'epoch_{epoch:04d}.png')
@@ -112,14 +88,16 @@ def train():
         num_workers=4
     )
     
-    # 모델 및 스케줄러 설정
+    # 모델 초기화 수정
     model = GC_DDPM(
         num_writers=config.num_writers,
         writer_embed_dim=256,
         image_size=config.image_size,
         max_width=config.max_width,
-        in_channels=2,  # x_t와 glyph 이미지가 concat 되었으므로 2
-        out_channels=2,  # noise와 variance 예측
+        in_channels=2,
+        out_channels=2,
+        betas=(config.beta_start, config.beta_end),
+        n_timesteps=config.num_train_timesteps
     ).to(config.device)
     
     # 체크포인트 로드 로직 수정
@@ -134,25 +112,12 @@ def train():
             start_epoch = checkpoint['epoch'] + 1
             print(f"에폭 {start_epoch}부터 학습을 재개합니다.")
     
-    noise_scheduler = DDPMScheduler(
-        num_train_timesteps=config.num_train_timesteps,
-        beta_start=config.beta_start,
-        beta_end=config.beta_end,
-        beta_schedule=config.beta_schedule,
-        prediction_type="epsilon"
-    )
-    
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate)
     lr_scheduler = get_cosine_schedule_with_warmup(
         optimizer=optimizer,
         num_warmup_steps=config.lr_warmup_steps,
         num_training_steps=(len(train_dataloader) * config.num_epochs)
     )
-    
-    # optimizer와 scheduler 상태 복원
-    if config.resume_from_checkpoint and os.path.exists(checkpoint_path):
-        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        lr_scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
     
     # Accelerator 설정
     accelerator = Accelerator(
@@ -165,10 +130,6 @@ def train():
     )
 
     # 학습 루프
-    betas = noise_scheduler.betas.to(config.device)
-    alphas = 1.0 - betas
-    alphas_cumprod = torch.cumprod(alphas, dim=0)
-    
     for epoch in range(start_epoch, config.num_epochs):
         model.train()
         progress_bar = tqdm(total=len(train_dataloader))
@@ -183,24 +144,28 @@ def train():
             use_guidance = torch.rand(1).item() < 0.1
             
             if use_guidance:
-                # 논문에서 제안한 guidance scale 사용
-                content_scale = 3.0  # content guidance scale (γ)
-                style_scale = 1.0    # style guidance scale (η)
+                content_scale = 3.0
+                style_scale = 1.0
             else:
                 content_scale = 0.0
                 style_scale = 0.0
 
-            noise = torch.randn_like(clean_images)
+            # 타임스텝 샘플링
             timesteps = torch.randint(
                 0, 
-                noise_scheduler.config.num_train_timesteps, 
+                model.n_timesteps, 
                 (clean_images.shape[0],), 
                 device=clean_images.device,
                 dtype=torch.long
             )
-            noisy_images = noise_scheduler.add_noise(clean_images, noise, timesteps)
+            
+            # 노이즈 추가
+            noise = torch.randn_like(clean_images)
+            alpha_t = model.alphas_cumprod[timesteps].view(-1, 1, 1, 1)
+            noisy_images = torch.sqrt(alpha_t) * clean_images + torch.sqrt(1 - alpha_t) * noise
             
             with accelerator.accumulate(model):
+                # 모델 예측
                 noise_pred, var_pred = model(
                     noisy_images, 
                     glyph_images, 
@@ -214,12 +179,8 @@ def train():
                 # Noise prediction loss
                 noise_loss = F.mse_loss(noise_pred, noise)
                 
-                # Variance prediction loss
-                betas_t = betas[timesteps]
-                alphas_cumprod_t = alphas_cumprod[timesteps]
-                alphas_cumprod_prev = alphas_cumprod[torch.clamp(timesteps - 1, min=0)]
-                
-                target_var = betas_t * (1.0 - alphas_cumprod_prev) / (1.0 - alphas_cumprod_t)
+                # Variance prediction loss (수정된 버전)
+                target_var = model.beta_tilde[timesteps]
                 var_pred = var_pred.mean([2, 3])
                 var_loss = F.mse_loss(var_pred.squeeze(1), target_var)
                 
@@ -237,14 +198,13 @@ def train():
                 noise_loss=noise_loss.item(),
                 var_loss=var_loss.item()
             )
-            
+        
         # 샘플 생성
         if accelerator.is_main_process:
             generate_samples(
                 config, 
                 epoch, 
-                accelerator.unwrap_model(model), 
-                noise_scheduler,
+                accelerator.unwrap_model(model)
             )
             
             # 모델 저장

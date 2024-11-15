@@ -18,10 +18,9 @@ class IAMDataset:
         self.config = config
         self.data_dir = config.data_dir
         
-        # transform 정의
+        # transform 수정 - [-1,1] 변환 제거 (모델에서 처리)
         self.transform = transforms.Compose([
             transforms.ToTensor(),
-            transforms.Lambda(lambda x: 2.0 * x - 1.0)  # [0,1] -> [-1,1] 범위로 변환
         ])
         # font 설정 
         self.font = ImageFont.truetype("DejaVuSans.ttf", self.config.image_size)  # 폰트 크기를 image_size에 맞춤
@@ -71,6 +70,11 @@ class IAMDataset:
         os.makedirs(self.glyph_dir, exist_ok=True)
         self.glyph_cache = {}
         
+        # # writer ID 목록 파일 저장 (샘플 생성시 필요)
+        # with open(os.path.join(self.data_dir, 'writer_ids.txt'), 'w') as f:
+        #     for wid in sorted(self.writer_ids):
+        #         f.write(f"{wid}\n")
+                
     def __getitem__(self, idx):
         sample = self.samples[idx]
         
@@ -98,9 +102,10 @@ class IAMDataset:
                 align_corners=False
             ).squeeze(0)
         
+        # 모든 이미지가 [0,1] 범위를 유지하도록 함
         return {
-            'images': image,        # (1, image_size, max_width)
-            'glyph': glyph,         # (1, image_size, max_width)
+            'images': image,        # (1, image_size, max_width) in [0,1]
+            'glyph': glyph,         # (1, image_size, max_width) in [0,1]
             'writer_id': torch.tensor(self.writer_id_to_idx[sample['writer_id']], dtype=torch.long),
             'text': sample['text']
         }
@@ -113,19 +118,19 @@ class IAMDataset:
         if text in self.glyph_cache:
             return self.glyph_cache[text]
 
-        # 빈 이미지 생성
-        img = Image.new('L', (self.config.max_width, self.config.image_size), color=0)
+        # 배경색을 흰색(255)으로, 텍스트를 검은색(0)으로 설정
+        img = Image.new('L', (self.config.max_width, self.config.image_size), color=255)
         draw = ImageDraw.Draw(img)
 
         # 텍스트 크기 측정
-        text_width = draw.textlength(text, font=self.font)  # textbbox 대신 textsize 사용
+        text_width = draw.textlength(text, font=self.font)
 
-        # 텍스트 중앙 정렬하여 그리기
+        # 텍스트 중앙 정렬
         x = (self.config.max_width - text_width) // 2
         y = 0  # 상단 정렬
-        draw.text((x, y), text, font=self.font, fill=255)
+        draw.text((x, y), text, font=self.font, fill=0)
 
-        # 변환 및 캐싱
+        # [0,1] 범위로 변환
         glyph_tensor = self.transform(img)
         self.glyph_cache[text] = glyph_tensor
         return glyph_tensor
@@ -139,12 +144,12 @@ class IAMDataset:
         new_width = int(self.config.image_size * aspect_ratio)
         img = img.resize((new_width, self.config.image_size), Image.LANCZOS)
 
-        # max_width에 맞춰 패딩 (양쪽 마진에 검은색 패딩)
-        padded_img = Image.new('L', (self.config.max_width, self.config.image_size), color=0)
+        # max_width에 맞춰 패딩 (양쪽 마진에 흰색 패딩)
+        padded_img = Image.new('L', (self.config.max_width, self.config.image_size), color=255)
         x_offset = (self.config.max_width - new_width) // 2
         padded_img.paste(img, (x_offset, 0))
 
-        # 변환
+        # [0,1] 범위로 변환
         return self.transform(padded_img)
 
     

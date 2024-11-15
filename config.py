@@ -26,9 +26,9 @@ class TrainingConfig:
     
 @dataclass
 class IAMTrainingConfig:
-    image_size: int = 32
-    max_width: int = 256
-    train_batch_size: int = 4
+    image_size: int = 16
+    max_width: int = 128
+    train_batch_size: int = 20
     num_epochs: int = 100
     num_train_timesteps: int = 1000
     beta_start: float = 0.0001
@@ -39,9 +39,9 @@ class IAMTrainingConfig:
     mixed_precision: str = "fp16"
     gradient_accumulation_steps: int = 1
     device: str = "cuda"
-    output_dir: str = "IAM_output_film"
+    output_dir: str = "./saved_models/241115"
     num_writers: int = 252  # IAM 데이터셋의 작성자 수
     data_dir: str = "./data/IAM_words"
     checkpoint_dir: str = output_dir + "/checkpoints"
-    resume_from_checkpoint = True  # 체크포인트에서 이어서 학습할지 여부
+    resume_from_checkpoint = False  # 체크포인트에서 이어서 학습할지 여부
     checkpoint_name = 'checkpoint_epoch_34.pt'  # 로드할 체크포인트 파일명
