@@ -13,7 +13,7 @@ def extract_writer_id(form_id):
     """
     return form_id.split('-')[1]  # '000u'와 같은 전체 ID 반환
 
-class IAMDataset:
+class IAMDataset(Dataset):
     def __init__(self, config: IAMTrainingConfig):
         self.config = config
         self.data_dir = config.data_dir
@@ -24,10 +24,6 @@ class IAMDataset:
         ])
         # font 설정 
         self.font = ImageFont.truetype("DejaVuSans.ttf", self.config.image_size)  # 폰트 크기를 image_size에 맞춤
-        
-        # config에서 필요한 값들 가져오기
-        self.image_size = config.image_size
-        self.max_width = config.max_width
         
         # words.txt 파일 읽기
         self.samples = []
@@ -43,6 +39,11 @@ class IAMDataset:
                 parts = line.strip().split()
                 if len(parts) < 9:  # 최소 필요한 필드 수 확인
                     continue
+                
+                # 텍스트 추출 및 길이 체크
+                text = ' '.join(parts[8:])  # transcription
+                if len(text.strip()) < 2:  # 두 글자 미만 건너뛰기
+                    continue
                     
                 image_name = parts[0]  # e.g., 'a01-000u-00-00'
                 form_id = '-'.join(image_name.split('-')[:2])  # e.g., 'a01-000u'
@@ -52,12 +53,23 @@ class IAMDataset:
                 if parts[1] != 'ok':
                     continue
                 
+                image_path = os.path.join(
+                    self.data_dir, 
+                    'words',
+                    form_id.split('-')[0],
+                    form_id,
+                    f"{image_name}.png"
+                )
+                
+                if not os.path.exists(image_path):
+                    continue
+                
                 self.writer_ids.add(writer_id)
                 self.samples.append({
                     'image_name': image_name,
                     'writer_id': writer_id,
-                    'text': ' '.join(parts[8:]),  # transcription (마지막 필드들을 모두 텍스트로)
-                    'bbox': [int(x) for x in parts[3:7]]  # bounding box
+                    'text': text,
+                    'bbox': [int(x) for x in parts[3:7]]
                 })
         
         # writer ID를 숫자 인덱스로 매핑 (정렬하여 일관된 인덱스 보장)
@@ -115,10 +127,11 @@ class IAMDataset:
     
     def create_glyph_image(self, text):
         """텍스트를 글리프 이미지로 변환"""
+        # 캐시에서 확인
         if text in self.glyph_cache:
             return self.glyph_cache[text]
 
-        # 배경색을 흰색(255)으로, 텍스트를 검은색(0)으로 설정
+        # 새로운 글리프 이미지 생성
         img = Image.new('L', (self.config.max_width, self.config.image_size), color=255)
         draw = ImageDraw.Draw(img)
 

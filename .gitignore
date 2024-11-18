@@ -5,3 +5,7 @@
 /data
 /mnist_handwriting_output
 /trainin_log.log
+*.png
+*.pt
+*.jpg
+*.pth

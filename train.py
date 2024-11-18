@@ -11,73 +11,79 @@ from PIL import Image
 import numpy as np
 from config import IAMTrainingConfig
 import torchvision.transforms as transforms
-from PIL import ImageDraw, ImageFont
-import time
 
 def generate_samples(config, epoch, model, batch_size=5):
     """
     수정된 GC_DDPM 모델을 사용하여 샘플을 생성합니다.
+    논문 설정: DDIM 샘플러, 50 스텝, content_scale=3.0, style_scale=1.0
     """
     model.eval()
     
-    # 글리프 이미지와 writer ID 준비
-    transform = transforms.Compose([
-        transforms.ToTensor(),
-    ])
+    # 데이터 준비를 한 번에 처리
+    glyphs_dir = os.path.join(config.data_dir, 'glyphs')
+    available_texts = [f.replace('.png', '') for f in os.listdir(glyphs_dir) 
+                      if f.endswith('.png') and '_' not in f 
+                      and len(f.replace('.png', '')) >= 3  # 3글자 이상
+                      and not all(not c.isalnum() for c in f.replace('.png', ''))]  # 특수문자로만 이루어지지 않은 것
+    selected_indices = np.random.choice(len(available_texts), batch_size, replace=False)
     
-    # writer IDs 로드
-    with open(os.path.join(config.data_dir, 'writer_ids.txt'), 'r') as f:
-        writer_ids = [line.strip() for line in f.readlines()]
-    
-    # 글리프 이미지 경로에서 사용 가능한 텍스트 목록 가져오기
-    glyph_dir = os.path.join(config.data_dir, 'glyphs')
-    available_texts = [f.replace('.png', '') for f in os.listdir(glyph_dir) if f.endswith('.png') and '_' not in f]
-    
-    # 랜덤 선택
-    selected_texts = np.random.choice(available_texts, batch_size, replace=False)
-    selected_writer_ids = np.random.choice(len(writer_ids), batch_size, replace=False)
-    
-    # 글리프 이미지 로드 및 전처리
+    # 글리프 이미지 한 번에 처리
     glyph_images = []
-    for text in selected_texts:
-        img_path = os.path.join(glyph_dir, f"{text}.png")
+    transform = transforms.Compose([transforms.ToTensor()])
+    
+    for idx in selected_indices:
+        text = available_texts[idx]
+        img_path = os.path.join(glyphs_dir, f"{text}.png")
         img = Image.open(img_path).convert('L')
         img = img.resize((config.max_width, config.image_size), Image.LANCZOS)
-        img_tensor = transform(img)
-        glyph_images.append(img_tensor)
+        glyph_images.append(transform(img))
     
     glyph_images = torch.stack(glyph_images).to(config.device)
-    writer_ids_tensor = torch.tensor(selected_writer_ids, dtype=torch.long).to(config.device)
     
-    # 수정된 모델의 sample 메소드 사용
-    with torch.no_grad():
-        samples = model.sample(
-            glyph=glyph_images,
-            writer_ids=writer_ids_tensor,
-            use_guidance=True,
-            content_scale=3.0,
-            style_scale=1.0
-        )
-    
-    # 결과 이미지 생성
-    samples_np = []
-    for i in range(batch_size):
-        glyph = (glyph_images[i].cpu().numpy() * 255).astype(np.uint8)
-        generated = (samples[i].cpu().numpy() * 255).astype(np.uint8)
+    # 각 writer ID에 대해 여러 번 생성
+    all_samples = []
+    for writer_id in range(1):  # 4명의 writer에 대해 생성
+        writer_ids_tensor = torch.full((batch_size,), writer_id, device=config.device)
         
-        combined = np.concatenate([glyph[0], generated[0]], axis=1)
-        samples_np.append(combined)
+        # DDIM 샘플링으로 이미지 생성
+        with torch.no_grad():
+            samples = model.ddim_sample(
+                glyph=glyph_images,
+                writer_ids=writer_ids_tensor,
+                use_guidance=True,
+                content_scale=3.0,
+                style_scale=1.0,
+                num_inference_steps=100,
+                eta=0.0
+            )
+            
+            # 결과 이미지 처리
+            samples_with_glyphs = torch.cat([glyph_images, samples], dim=3)  # 가로로 연결
+            samples_with_glyphs = samples_with_glyphs.squeeze(1)  # [B, H, W]
+            all_samples.append(samples_with_glyphs)
     
-    final_image = np.concatenate(samples_np, axis=0)
+    # 모든 샘플을 하나의 이미지로 결합
+    all_samples = torch.cat(all_samples, dim=0)  # [4*B, H, W]
     
+    # numpy로 변환하고 값 범위 조정
+    final_image = all_samples.cpu().numpy()  # [4*B, H, W]
+    final_image = (final_image * 255).astype(np.uint8)
+    
+    # 이미지들을 세로로 쌓기 (5개의 이미지를 하나로 합치기)
+    H, W = final_image.shape[1], final_image.shape[2]
+    combined_image = np.zeros((H * final_image.shape[0], W), dtype=np.uint8)
+    
+    # 각 이미지를 세로로 쌓기
+    for idx in range(final_image.shape[0]):
+        combined_image[idx * H:(idx + 1) * H, :] = final_image[idx]
+    
+    # 저장
     os.makedirs(os.path.join(config.output_dir, 'samples'), exist_ok=True)
-    Image.fromarray(final_image).save(
+    Image.fromarray(combined_image, mode='L').save(
         os.path.join(config.output_dir, 'samples', f'epoch_{epoch:04d}.png')
     )
 
-def train():
-    config = IAMTrainingConfig()
-
+def train(config):
     # 데이터셋 및 데이터로더 설정
     dataset = IAMDataset(config)
     
@@ -105,12 +111,35 @@ def train():
     if config.resume_from_checkpoint:
         checkpoint_path = os.path.join(config.checkpoint_dir, config.checkpoint_name)
         if os.path.exists(checkpoint_path):
-            print(f"체크포인트를 로드합니다: {checkpoint_path}")
-            # map_location 파라미터 추가
-            checkpoint = torch.load(checkpoint_path, map_location=config.device)
-            model.load_state_dict(checkpoint['model_state_dict'])
-            start_epoch = checkpoint['epoch'] + 1
-            print(f"에폭 {start_epoch}부터 학습을 재개합니다.")
+            print(f"load checkpoint: {checkpoint_path}")
+            try:
+                # 먼저 weights_only=True로 시도
+                checkpoint = torch.load(
+                    checkpoint_path,
+                    map_location=lambda storage, loc: storage.cuda(config.gpu_num),
+                    weights_only=True
+                )
+            except:
+                # 실패하면 weights_only=False로 재시도
+                print("Retrying checkpoint load with weights_only=False")
+                checkpoint = torch.load(
+                    checkpoint_path,
+                    map_location=lambda storage, loc: storage.cuda(config.gpu_num),
+                    weights_only=False
+                )
+                
+            model.load_state_dict(checkpoint, strict=False)
+            
+            # checkpoint 파일명에서 epoch 파싱
+            epoch = int(config.checkpoint_name.split('_')[-1].split('.')[0])
+            start_epoch = epoch + 1
+            
+            print(f"resume from epoch {start_epoch}")
+            generate_samples(
+                config,
+                epoch,
+                model,
+            )
     
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate)
     lr_scheduler = get_cosine_schedule_with_warmup(
@@ -175,16 +204,33 @@ def train():
                     content_scale=content_scale,
                     style_scale=style_scale
                 )
-                
-                # Noise prediction loss
+                if torch.isnan(noise_pred).any() or torch.isnan(var_pred).any():
+                    print("Model output contains NaN values")
+                    continue
+                # Noise prediction loss (MSE)
                 noise_loss = F.mse_loss(noise_pred, noise)
-                
-                # Variance prediction loss (수정된 버전)
-                target_var = model.beta_tilde[timesteps]
-                var_pred = var_pred.mean([2, 3])
-                var_loss = F.mse_loss(var_pred.squeeze(1), target_var)
-                
-                loss = noise_loss + 0.1 * var_loss
+
+                # Variance prediction loss (논문 수식 6)
+                # Σθ(xt, g, w) = exp(νθ(xt, g, w) log βt + (1 - νθ(xt, g, w)) log β̃t)
+                beta_t = model.betas[timesteps]
+                beta_tilde_t = model.beta_tilde[timesteps]
+
+                # numerical stability를 위한 clamp 추가
+                log_beta_t = torch.log(torch.clamp(beta_t, min=1e-8))
+                log_beta_tilde_t = torch.log(torch.clamp(beta_tilde_t, min=1e-8))
+
+                # var_pred를 [0,1] 범위로 제한
+                var_pred = var_pred.mean([2, 3]).squeeze(1)
+                var_pred = torch.sigmoid(var_pred)  # νθ를 [0,1] 범위로 제한
+
+                # target variance 계산
+                target_var = torch.exp(var_pred * log_beta_t + (1 - var_pred) * log_beta_tilde_t)
+
+                # variance loss (MSE)
+                var_loss = F.mse_loss(var_pred, target_var)
+
+                # total loss (논문에서는 구체적인 가중치를 명시하지 않음)
+                loss = noise_loss + 0.01 * var_loss  # variance loss의 가중치를 0.1에서 0.01로 줄임
                 
                 accelerator.backward(loss)
                 accelerator.clip_grad_norm_(model.parameters(), 1.0)
@@ -208,16 +254,16 @@ def train():
             )
             
             # 모델 저장
-            os.makedirs(config.checkpoint_dir, exist_ok=True) 
-            torch.save({
-                'epoch': epoch,
-                'model_state_dict': accelerator.unwrap_model(model).state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'scheduler_state_dict': lr_scheduler.state_dict(),
-                'loss': loss.item(),
-            }, os.path.join(config.checkpoint_dir, f'checkpoint_epoch_{epoch}.pt'))
+            os.makedirs(config.checkpoint_dir, exist_ok=True)
+            torch.save(
+                accelerator.unwrap_model(model).state_dict(),
+                os.path.join(config.checkpoint_dir, f'checkpoint_epoch_{epoch}.pt')
+            )
 
 if __name__ == "__main__":
+    config = IAMTrainingConfig()
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(config.gpu_num)
     os.environ["NCCL_P2P_DISABLE"] = "1"
     os.environ["NCCL_IB_DISABLE"] = "1"
-    train()
+    torch.cuda.set_device(config.gpu_num)
+    train(config)

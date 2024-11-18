@@ -1,0 +1,49 @@
+nohup: ignoring input
+/home/sgh/anaconda3/envs/diffusion/lib/python3.11/site-packages/accelerate/accelerator.py:494: FutureWarning: `torch.cuda.amp.GradScaler(args...)` is deprecated. Please use `torch.amp.GradScaler('cuda', args...)` instead.
+  self.scaler = torch.cuda.amp.GradScaler(**kwargs)
+Total unique writers: 252
+Total samples: 33283
+  0%|          | 0/4161 [00:00<?, ?it/s]Epoch 0:   0%|          | 0/4161 [00:00<?, ?it/s]Traceback (most recent call last):
+  File "/mnt/hdd1/sgh/Diffusion/diffusers/src2/train.py", line 272, in <module>
+    train(config)
+  File "/mnt/hdd1/sgh/Diffusion/diffusers/src2/train.py", line 183, in train
+    noise_pred, var_pred = model(
+                           ^^^^^^
+  File "/home/sgh/anaconda3/envs/diffusion/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1553, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/sgh/anaconda3/envs/diffusion/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1562, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/sgh/anaconda3/envs/diffusion/lib/python3.11/site-packages/accelerate/utils/operations.py", line 820, in forward
+    return model_forward(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/sgh/anaconda3/envs/diffusion/lib/python3.11/site-packages/accelerate/utils/operations.py", line 808, in __call__
+    return convert_to_fp32(self.model_forward(*args, **kwargs))
+                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/sgh/anaconda3/envs/diffusion/lib/python3.11/site-packages/torch/amp/autocast_mode.py", line 43, in decorate_autocast
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/hdd1/sgh/Diffusion/diffusers/src2/model.py", line 617, in forward
+    pred = self.unet(x_input, timesteps, w_emb)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/sgh/anaconda3/envs/diffusion/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1553, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/sgh/anaconda3/envs/diffusion/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1562, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/hdd1/sgh/Diffusion/diffusers/src2/model.py", line 499, in forward
+    x = upsample_block(x, res_samples, t_emb)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/sgh/anaconda3/envs/diffusion/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1553, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/sgh/anaconda3/envs/diffusion/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1562, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/sgh/anaconda3/envs/diffusion/lib/python3.11/site-packages/diffusers/models/unets/unet_2d_blocks.py", line 2654, in forward
+    hidden_states = torch.cat([hidden_states, res_hidden_states], dim=1)
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+RuntimeError: Tensors must have same number of dimensions: got 4 and 3
+Epoch 0:   0%|          | 0/4161 [00:00<?, ?it/s]

@@ -1,37 +1,39 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import torch
 import torch.nn as nn
 from diffusers import UNet2DConditionModel
-from diffusers.models.embeddings import TimestepEmbedding, Timesteps
 from typing import Union, Optional, Dict, Any, Tuple
 from diffusers import UNet2DConditionModel
 from diffusers.models.unets.unet_2d_condition import UNet2DConditionOutput
+from tqdm import tqdm
+from config import IAMTrainingConfig as cfg
+
 
 class FiLM(nn.Module):
     def __init__(self, num_features, condition_vector_dim):
-        super(FiLM, self).__init__()
+        super().__init__()
         self.num_features = num_features
         self.condition_generator = nn.Linear(condition_vector_dim, num_features * 2)
 
     def forward(self, x, condition):
+        # condition이 None인 경우 처리
+        if condition is None:
+            # identity mapping 반환
+            return x
+            
+        # L2 normalization 적용
         if len(condition.shape) == 3:
             condition = condition.mean(dim=1)
-            
-        params = self.condition_generator(condition)
+        condition = condition / torch.norm(condition, dim=-1, keepdim=True)
         
-        if params.shape[1] < 2:
-            raise ValueError(f"params shape {params.shape} is too small to chunk into gamma and beta")
-            
+        params = self.condition_generator(condition)
         gamma, beta = torch.chunk(params, chunks=2, dim=-1)
         
         gamma = gamma.view(*gamma.shape, 1, 1).expand_as(x)
         beta = beta.view(*beta.shape, 1, 1).expand_as(x)
         
-        output = gamma * x + beta
-        
-        return output
+        return gamma * x + beta
     
     
 class FiLM_UNet2DConditionModel(UNet2DConditionModel):
@@ -63,6 +65,14 @@ class FiLM_UNet2DConditionModel(UNet2DConditionModel):
             timesteps = torch.tensor([timesteps], dtype=torch.long, device=sample.device)
         elif torch.is_tensor(timesteps) and len(timesteps.shape) == 0:
             timesteps = timesteps[None].to(sample.device)
+        if encoder_hidden_states is None:
+            batch_size = sample.shape[0]
+            # 모델의 cross_attention_dim 크기에 맞는 제로 텐서 생성
+            encoder_hidden_states = torch.zeros(
+                (batch_size, 1, self.config.cross_attention_dim),  
+                device=sample.device,
+                dtype=sample.dtype
+            )
 
         timesteps = timesteps.expand(sample.shape[0])
 
@@ -96,14 +106,16 @@ class FiLM_UNet2DConditionModel(UNet2DConditionModel):
             down_block_res_samples += res_samples
 
         if self.mid_block is not None:
-            sample = self.mid_block(
-                sample,
-                emb,
-                encoder_hidden_states=encoder_hidden_states,
-                attention_mask=attention_mask,
-                cross_attention_kwargs=cross_attention_kwargs,
-            )
-
+            if hasattr(self.mid_block, 'has_cross_attention') and self.mid_block.has_cross_attention:
+                sample = self.mid_block(
+                    sample,
+                    emb,
+                    encoder_hidden_states=encoder_hidden_states,
+                    attention_mask=attention_mask,
+                    cross_attention_kwargs=cross_attention_kwargs,
+                )
+            else:
+                sample = self.mid_block(sample, emb) 
         for up_block_idx, up_block in enumerate(self.up_blocks):
             res_samples = down_block_res_samples[-len(up_block.resnets) :]
             down_block_res_samples = down_block_res_samples[: -len(up_block.resnets)]
@@ -131,8 +143,6 @@ class FiLM_UNet2DConditionModel(UNet2DConditionModel):
 
         return UNet2DConditionOutput(sample=sample)
 
-
-
 class GC_DDPM(nn.Module):
     def __init__(
         self,
@@ -147,7 +157,29 @@ class GC_DDPM(nn.Module):
     ):
         super().__init__()
         
-        self.unet = FiLM_UNet2DConditionModel(
+        # self.unet = FiLM_UNet2DConditionModel(
+        #     sample_size=(image_size, max_width),
+        #     in_channels=in_channels,
+        #     out_channels=out_channels,
+        #     layers_per_block=2,
+        #     block_out_channels=(128, 256, 512, 512),
+        #     cross_attention_dim=writer_embed_dim * 4,
+        #     down_block_types=(
+        #         "CrossAttnDownBlock2D",
+        #         "CrossAttnDownBlock2D",
+        #         "CrossAttnDownBlock2D",
+        #         "DownBlock2D",
+        #     ),
+        #     up_block_types=(
+        #         "UpBlock2D",
+        #         "CrossAttnUpBlock2D",
+        #         "CrossAttnUpBlock2D",
+        #         "CrossAttnUpBlock2D",
+        #     ), 
+        #     time_embedding_act_fn="swish"
+        # )
+
+        self.unet = UNet2DConditionModel(
             sample_size=(image_size, max_width),
             in_channels=in_channels,
             out_channels=out_channels,
@@ -169,8 +201,13 @@ class GC_DDPM(nn.Module):
             time_embedding_act_fn="swish"
         )
 
+
+        # self.writer_embedding = nn.Embedding(num_writers, writer_embed_dim)
+        # self.writer_norm = nn.LayerNorm(writer_embed_dim)
+        # self.writer_proj = nn.Linear(writer_embed_dim, writer_embed_dim * 4)
+            # Writer embedding (논문에 명시된 대로)
         self.writer_embedding = nn.Embedding(num_writers, writer_embed_dim)
-        self.writer_norm = nn.LayerNorm(writer_embed_dim)
+        self.writer_norm = lambda x: x / torch.norm(x, dim=-1, keepdim=True)
         self.writer_proj = nn.Linear(writer_embed_dim, writer_embed_dim * 4)
         
         # DDPM 관련 파라미터 초기화
@@ -196,117 +233,178 @@ class GC_DDPM(nn.Module):
         )
         return mean
         
-    def compute_variance(self, pred_v, t):
-        # v_θ를 사용하여 분산 계산
-        beta_t = self.betas[t]
-        beta_tilde_t = self.beta_tilde[t]
+    def compute_variance(self, var_pred, timesteps):
+        """논문 수식 (6)에 따른 variance 계산"""
+        beta_t = self.betas[timesteps]
+        beta_tilde_t = self.beta_tilde[timesteps]
         
-        variance = torch.exp(
-            pred_v * torch.log(beta_t) + (1 - pred_v) * torch.log(beta_tilde_t)
+        # Σθ(xt, g, w) = exp(νθ(xt, g, w) log βt + (1 - νθ(xt, g, w)) log β̃t)
+        var = torch.exp(
+            var_pred * torch.log(beta_t) + 
+            (1 - var_pred) * torch.log(beta_tilde_t)
         )
-        return variance
+        return var
         
     def forward(self, x, glyph, timesteps, writer_ids=None, use_guidance=False, content_scale=3.0, style_scale=1.0):
-        # 입력 정규화
-        x = x * 2.0 - 1.0
-        glyph = glyph * 2.0 - 1.0
+        # 입력 정규화 - clamp 추가
+        x = torch.clamp(x * 2.0 - 1.0, -1.0, 1.0)
+        glyph = torch.clamp(glyph * 2.0 - 1.0, -1.0, 1.0)
         
-        # 기본 입력 생성
         x_input = torch.cat([x, glyph], dim=1)
-        uncond_glyph = torch.zeros_like(glyph)
-        x_input_style = torch.cat([x, uncond_glyph], dim=1)
-
+        
+        # 빈 인코더 상태 생성 (재사용)
+        empty_encoder_states = torch.zeros(
+            (x_input.shape[0], 1, self.unet.config.cross_attention_dim),
+            device=x_input.device,
+            dtype=x_input.dtype
+        )
+        
         if use_guidance:
-            # 1. Unconditional embedding (no writer, no glyph)
-            uncond_ids = torch.zeros_like(writer_ids)
-            uncond_emb = self.writer_embedding(uncond_ids)
-            uncond_emb = self.writer_norm(uncond_emb)
-            uncond_emb = uncond_emb / torch.norm(uncond_emb, dim=-1, keepdim=True)
-            uncond_emb = self.writer_proj(uncond_emb)
-            uncond_hidden = uncond_emb.unsqueeze(1)
+            null_glyph = torch.zeros_like(glyph)
+            w_emb = self.writer_embedding(writer_ids)
             
-            # 2. Conditional writer embedding
-            cond_emb = self.writer_embedding(writer_ids)
-            cond_emb = self.writer_norm(cond_emb)
-            cond_emb = cond_emb / torch.norm(cond_emb, dim=-1, keepdim=True)
-            cond_emb = self.writer_proj(cond_emb)
-            cond_hidden = cond_emb.unsqueeze(1)
+            # writer embedding 정규화에 epsilon 추가
+            w_emb = w_emb / (torch.norm(w_emb, dim=-1, keepdim=True) + 1e-8)
+            w_emb = self.writer_proj(w_emb)
             
-            # ε_θ(x_t, ∅, ∅) - 완전 unconditional
-            x_input_uncond = torch.cat([x, uncond_glyph], dim=1)
-            full_uncond = self.unet(x_input_uncond, timesteps, encoder_hidden_states=uncond_hidden).sample
-            full_uncond_noise, full_uncond_v = torch.split(full_uncond, 1, dim=1)
+            # NaN 체크 및 처리
+            if torch.isnan(w_emb).any():
+                w_emb = torch.nan_to_num(w_emb, nan=0.0, posinf=1.0, neginf=-1.0)
             
-            # ε_θ(x_t, g, ∅) - content-only
-            content_only = self.unet(x_input, timesteps, encoder_hidden_states=uncond_hidden).sample
-            content_noise, content_v = torch.split(content_only, 1, dim=1)
+            # 1. Full condition
+            pred_full = self.unet(x_input, timesteps, encoder_hidden_states=w_emb.unsqueeze(1)).sample
             
-            # ε_θ(x_t, ∅, w) - style-only
-            style_only = self.unet(x_input_style, timesteps, encoder_hidden_states=cond_hidden).sample
-            style_noise, style_v = torch.split(style_only, 1, dim=1)
+            # 2. Content only
+            pred_content = self.unet(x_input, timesteps, encoder_hidden_states=empty_encoder_states).sample
             
-            # ε_θ(x_t, g, w) - full conditional
-            full_cond = self.unet(x_input, timesteps, encoder_hidden_states=cond_hidden).sample
-            full_cond_noise, full_cond_v = torch.split(full_cond, 1, dim=1)
+            # 3. Style only
+            x_input_style = torch.cat([x, null_glyph], dim=1)
+            pred_style = self.unet(x_input_style, timesteps, encoder_hidden_states=w_emb.unsqueeze(1)).sample
+            
+            # 4. No condition
+            pred_uncond = self.unet(x_input_style, timesteps, encoder_hidden_states=empty_encoder_states).sample
+            
+            # Guidance scale 값 제한
+            content_scale = torch.clamp(torch.tensor(content_scale), -10.0, 10.0)
+            style_scale = torch.clamp(torch.tensor(style_scale), -10.0, 10.0)
             
             # Classifier-free guidance 적용
             noise_pred = (
-                full_cond_noise + 
-                content_scale * content_noise + 
-                style_scale * style_noise - 
-                (content_scale + style_scale) * full_uncond_noise
+                pred_full + 
+                content_scale * pred_content + 
+                style_scale * pred_style - 
+                (content_scale + style_scale) * pred_uncond
             )
             
-            # Variance prediction도 동일한 방식으로 결합
-            var_pred = (
-                full_cond_v + 
-                content_scale * content_v + 
-                style_scale * style_v - 
-                (content_scale + style_scale) * full_uncond_v
-            )
+            # NaN 체크 및 처리
+            noise_pred = torch.nan_to_num(noise_pred, nan=0.0, posinf=1.0, neginf=-1.0)
+            
+            _, var_pred = torch.chunk(pred_full, 2, dim=1)
+            noise_pred, _ = torch.chunk(noise_pred, 2, dim=1)
             
         else:
-            # 기본 조건부 생성
-            w_emb = self.writer_embedding(writer_ids)
-            w_emb = self.writer_norm(w_emb)
-            w_emb = w_emb / torch.norm(w_emb, dim=-1, keepdim=True)
-            w_emb = self.writer_proj(w_emb)
-            encoder_hidden_states = w_emb.unsqueeze(1)
+            if writer_ids is not None:
+                w_emb = self.writer_embedding(writer_ids)
+                w_emb = w_emb / (torch.norm(w_emb, dim=-1, keepdim=True) + 1e-8)
+                w_emb = self.writer_proj(w_emb)
+                
+                # NaN 체크 및 처리
+                if torch.isnan(w_emb).any():
+                    w_emb = torch.nan_to_num(w_emb, nan=0.0, posinf=1.0, neginf=-1.0)
+                
+                encoder_states = w_emb.unsqueeze(1)
+            else:
+                encoder_states = empty_encoder_states
             
-            pred = self.unet(x_input, timesteps, encoder_hidden_states=encoder_hidden_states).sample
-            noise_pred, var_pred = torch.split(pred, 1, dim=1)
+            pred = self.unet(x_input, timesteps, encoder_hidden_states=encoder_states).sample
+            noise_pred, var_pred = torch.chunk(pred, 2, dim=1)
+        
+        # 최종 출력값 clamp 및 NaN 처리
+        noise_pred = torch.clamp(noise_pred, -10.0, 10.0)
+        var_pred = torch.clamp(var_pred, -10.0, 10.0)
+        
+        noise_pred = torch.nan_to_num(noise_pred, nan=0.0, posinf=1.0, neginf=-1.0)
+        var_pred = torch.nan_to_num(var_pred, nan=0.0, posinf=1.0, neginf=-1.0)
         
         return noise_pred, var_pred
 
+    def predict_start_from_noise(self, x_t, t, noise):
+        """노이즈로부터 x_0 예측"""
+        alpha_cumprod_t = self.alphas_cumprod[t]
+        return (
+            torch.sqrt(1. / alpha_cumprod_t) * x_t -
+            torch.sqrt(1. / alpha_cumprod_t - 1) * noise
+        )
+
     @torch.no_grad()
-    def sample(self, glyph, writer_ids, use_guidance=True, content_scale=3.0, style_scale=1.0):
-        device = next(self.parameters()).device
+    def ddim_sample(
+        self,
+        glyph,
+        writer_ids,
+        use_guidance=True,
+        content_scale=3.0,
+        style_scale=1.0,
+        num_inference_steps=50,
+        eta=0.0  # η=0이면 DDIM, η=1이면 DDPM
+    ):
+        # device = next(self.parameters()).device
+        device = cfg.device
         batch_size = glyph.shape[0]
         
         # 초기 노이즈에서 시작
         x = torch.randn((batch_size, 1, glyph.shape[2], glyph.shape[3]), device=device)
         
-        # Reverse diffusion process
-        for t in reversed(range(self.n_timesteps)):
-            timesteps = torch.full((batch_size,), t, device=device, dtype=torch.long)
+        # DDIM 타임스텝 시퀀스 생성
+        timesteps = torch.linspace(self.n_timesteps - 1, 0, num_inference_steps, dtype=torch.long, device=device)
+        
+        for i, t in enumerate(tqdm(timesteps, desc="DDIM sampling")):
+            # 다음 타임스텝 계산
+            next_t = timesteps[i + 1] if i < len(timesteps) - 1 else torch.tensor(-1)
             
-            # 노이즈와 분산 예측
-            noise_pred, var_pred = self.forward(
-                x, glyph, timesteps, writer_ids, 
+            # 현재 타임스텝의 배치 생성
+            t_batch = torch.full((batch_size,), t, device=device, dtype=torch.long)
+            
+            # 노이즈 예측
+            noise_pred, _ = self.forward(
+                x, glyph, t_batch, writer_ids,
                 use_guidance, content_scale, style_scale
             )
             
-            # 평균과 분산 계산
-            mean = self.compute_mean(x, noise_pred, t)
-            variance = self.compute_variance(var_pred, t)
+            # x_0 예측
+            pred_original_sample = self.predict_start_from_noise(x, t, noise_pred)
             
-            # 노이즈 추가 (t > 0인 경우에만)
-            if t > 0:
-                noise = torch.randn_like(x)
-                x = mean + torch.sqrt(variance) * noise
-            else:
-                x = mean
+            if next_t >= 0:
+                alpha_cumprod_t = self.alphas_cumprod[t]
+                alpha_cumprod_next_t = self.alphas_cumprod[next_t]
                 
-        # [-1, 1] 범위를 [0, 1] 범위로 변환
+                # DDIM 업데이트 공식
+                sigma = eta * torch.sqrt(
+                    (1 - alpha_cumprod_next_t) / (1 - alpha_cumprod_t) *
+                    (1 - alpha_cumprod_t / alpha_cumprod_next_t)
+                )
+                
+                # 노이즈 샘플링
+                noise = torch.randn_like(x) if eta > 0 else 0.
+                
+                # DDIM 업데이트
+                x = torch.sqrt(alpha_cumprod_next_t) * pred_original_sample + \
+                    torch.sqrt(1 - alpha_cumprod_next_t - sigma ** 2) * noise_pred + \
+                    sigma * noise
+            else:
+                # 마지막 스텝
+                x = pred_original_sample
+        
         x = (x + 1) / 2
         return x.clamp(0, 1)
+    @torch.no_grad()
+    def sample(self, glyph, writer_ids, use_guidance=True, content_scale=3.0, style_scale=1.0, num_inference_steps=50):
+        """기존 sample 메서드를 DDIM을 사용하도록 수정"""
+        return self.ddim_sample(
+            glyph=glyph,
+            writer_ids=writer_ids,
+            use_guidance=use_guidance,
+            content_scale=content_scale,
+            style_scale=style_scale,
+            num_inference_steps=num_inference_steps,
+            eta=0.0  # DDIM 사용 (η=0)
+        )

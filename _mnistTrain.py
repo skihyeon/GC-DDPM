@@ -1,5 +1,5 @@
 import torch
-from tempData import MNISTHandwritingDataset
+from _mnistData import MNISTHandwritingDataset
 from model import GC_DDPM
 from config import TrainingConfig
 from diffusers import DDPMScheduler
