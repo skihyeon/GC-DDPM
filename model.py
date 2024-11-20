@@ -1,53 +1,67 @@
 import torch
 import torch.nn as nn
-import torch
-import torch.nn as nn
-from diffusers import UNet2DConditionModel
 from typing import Union, Optional, Dict, Any, Tuple
 from diffusers import UNet2DConditionModel
 from diffusers.models.unets.unet_2d_condition import UNet2DConditionOutput
 from tqdm import tqdm
 from config import IAMTrainingConfig as cfg
+import math
 
+class SinusoidalTimeEmbedding(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.dim = dim
+        self.time_proj = nn.Sequential(
+            nn.Linear(dim, dim * 4),
+            nn.SiLU(),
+            nn.Linear(dim * 4, dim * 4)
+        )
+    
+    def forward(self, t):
+        half_dim = self.dim // 2
+        embeddings = math.log(10000) / (half_dim - 1)
+        embeddings = torch.exp(torch.arange(half_dim, device=t.device) * -embeddings)
+        embeddings = t[:, None] * embeddings[None, :]
+        embeddings = torch.cat((embeddings.sin(), embeddings.cos()), dim=-1)
+        return self.time_proj(embeddings)
 
 class FiLM(nn.Module):
     def __init__(self, num_features, condition_vector_dim):
         super().__init__()
-        self.num_features = num_features
-        self.condition_generator = nn.Linear(condition_vector_dim, num_features * 2)
-
+        self.condition_generator = nn.Sequential(
+            nn.Linear(condition_vector_dim, num_features * 2),
+            nn.SiLU(),
+            nn.Linear(num_features * 2, num_features * 2)
+        )
+        
     def forward(self, x, condition):
-        # condition이 None인 경우 처리
         if condition is None:
-            # identity mapping 반환
             return x
             
-        # L2 normalization 적용
+        # L2 normalization
         if len(condition.shape) == 3:
             condition = condition.mean(dim=1)
-        condition = condition / torch.norm(condition, dim=-1, keepdim=True)
+        condition = condition / (torch.norm(condition, dim=-1, keepdim=True) + 1e-8)
         
         params = self.condition_generator(condition)
         gamma, beta = torch.chunk(params, chunks=2, dim=-1)
         
-        gamma = gamma.view(*gamma.shape, 1, 1).expand_as(x)
-        beta = beta.view(*beta.shape, 1, 1).expand_as(x)
+        gamma = gamma.view(*gamma.shape, 1, 1)
+        beta = beta.view(*beta.shape, 1, 1)
         
         return gamma * x + beta
-    
     
 class FiLM_UNet2DConditionModel(UNet2DConditionModel):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         
-        self.film_layers_down = nn.ModuleList([
-            FiLM(num_features=block.resnets[0].conv1.out_channels, condition_vector_dim=kwargs['cross_attention_dim'])
+        # FiLM 레이어 추가 (down blocks에만 적용)
+        self.film_layers = nn.ModuleList([
+            FiLM(
+                num_features=block.resnets[0].conv1.out_channels,
+                condition_vector_dim=kwargs['cross_attention_dim']
+            )
             for block in self.down_blocks
-        ])
-        
-        self.film_layers_up = nn.ModuleList([
-            FiLM(num_features=block.resnets[0].conv1.out_channels, condition_vector_dim=kwargs['cross_attention_dim'])
-            for block in self.up_blocks
         ])
 
     def forward(
@@ -60,80 +74,61 @@ class FiLM_UNet2DConditionModel(UNet2DConditionModel):
         cross_attention_kwargs: Optional[Dict[str, Any]] = None,
         return_dict: bool = True,
     ) -> Union[UNet2DConditionOutput, Tuple]:
-        timesteps = timestep
-        if not torch.is_tensor(timesteps):
-            timesteps = torch.tensor([timesteps], dtype=torch.long, device=sample.device)
-        elif torch.is_tensor(timesteps) and len(timesteps.shape) == 0:
-            timesteps = timesteps[None].to(sample.device)
-        if encoder_hidden_states is None:
-            batch_size = sample.shape[0]
-            # 모델의 cross_attention_dim 크기에 맞는 제로 텐서 생성
-            encoder_hidden_states = torch.zeros(
-                (batch_size, 1, self.config.cross_attention_dim),  
-                device=sample.device,
-                dtype=sample.dtype
-            )
-
-        timesteps = timesteps.expand(sample.shape[0])
-
-        t_emb = self.time_proj(timesteps)
-        t_emb = t_emb.to(dtype=self.dtype)
-        emb = self.time_embedding(t_emb)
-
-        if self.class_embedding is not None:
-            if class_labels is None:
-                raise ValueError("class_labels should be provided when num_class_embeds > 0")
-            class_emb = self.class_embedding(class_labels).to(dtype=self.dtype)
-            emb = emb + class_emb
-
+        # 기존 UNet forward 로직 유지하면서 FiLM만 추가
         sample = self.conv_in(sample)
 
+        # Down blocks with FiLM
         down_block_res_samples = (sample,)
         for down_block_idx, down_block in enumerate(self.down_blocks):
             if hasattr(down_block, "has_cross_attention") and down_block.has_cross_attention:
                 sample, res_samples = down_block(
                     hidden_states=sample,
-                    temb=emb,
+                    temb=timestep,
                     encoder_hidden_states=encoder_hidden_states,
                     attention_mask=attention_mask,
                     cross_attention_kwargs=cross_attention_kwargs,
                 )
             else:
-                sample, res_samples = down_block(hidden_states=sample, temb=emb)
+                sample, res_samples = down_block(hidden_states=sample, temb=timestep)
 
-            sample = self.film_layers_down[down_block_idx](sample, encoder_hidden_states)
-
+            # FiLM 적용
+            sample = self.film_layers[down_block_idx](sample, encoder_hidden_states)
             down_block_res_samples += res_samples
 
-        if self.mid_block is not None:
-            if hasattr(self.mid_block, 'has_cross_attention') and self.mid_block.has_cross_attention:
-                sample = self.mid_block(
-                    sample,
-                    emb,
-                    encoder_hidden_states=encoder_hidden_states,
-                    attention_mask=attention_mask,
-                    cross_attention_kwargs=cross_attention_kwargs,
-                )
-            else:
-                sample = self.mid_block(sample, emb) 
-        for up_block_idx, up_block in enumerate(self.up_blocks):
-            res_samples = down_block_res_samples[-len(up_block.resnets) :]
-            down_block_res_samples = down_block_res_samples[: -len(up_block.resnets)]
+        # Mid block
+        if hasattr(self.mid_block, "has_cross_attention") and self.mid_block.has_cross_attention:
+            sample = self.mid_block(
+                sample,
+                timestep,
+                encoder_hidden_states=encoder_hidden_states,
+                attention_mask=attention_mask,
+                cross_attention_kwargs=cross_attention_kwargs,
+            )
+        else:
+            sample = self.mid_block(sample, timestep)
+
+        # Up blocks
+        for up_block in self.up_blocks:
+            res_samples = down_block_res_samples[-len(up_block.resnets):]
+            down_block_res_samples = down_block_res_samples[:-len(up_block.resnets)]
 
             if hasattr(up_block, "has_cross_attention") and up_block.has_cross_attention:
                 sample = up_block(
                     hidden_states=sample,
-                    temb=emb,
+                    temb=timestep,
                     res_hidden_states_tuple=res_samples,
                     encoder_hidden_states=encoder_hidden_states,
-                    cross_attention_kwargs=cross_attention_kwargs,
                     attention_mask=attention_mask,
+                    cross_attention_kwargs=cross_attention_kwargs,
                 )
             else:
-                sample = up_block(hidden_states=sample, temb=emb, res_hidden_states_tuple=res_samples)
+                sample = up_block(
+                    hidden_states=sample,
+                    temb=timestep,
+                    res_hidden_states_tuple=res_samples,
+                )
 
-            sample = self.film_layers_up[up_block_idx](sample, encoder_hidden_states)
-
+        # Output
         sample = self.conv_norm_out(sample)
         sample = self.conv_act(sample)
         sample = self.conv_out(sample)
@@ -152,11 +147,22 @@ class GC_DDPM(nn.Module):
         max_width=512,
         in_channels=2,
         out_channels=2,
-        betas=(1e-4, 0.02),  # β_start와 β_end 값 추가
-        n_timesteps=1000,    # timestep 수 추가
+        n_timesteps=1000,
     ):
         super().__init__()
         
+        self.num_writers = num_writers
+        self.null_writer_id = num_writers  # null writer ID를 명시적으로 저장
+        
+        # Writer embedding (+1 for null token)
+        self.writer_embedding = nn.Embedding(num_writers + 1, writer_embed_dim)  # +1은 null token을 위한 것
+        # print(f"Embedding size: {self.writer_embedding.weight.shape}")
+        self.writer_proj = nn.Sequential(
+            nn.Linear(writer_embed_dim, writer_embed_dim * 4),
+            nn.SiLU(),
+            nn.Linear(writer_embed_dim * 4, writer_embed_dim * 4)
+        )
+
         # self.unet = FiLM_UNet2DConditionModel(
         #     sample_size=(image_size, max_width),
         #     in_channels=in_channels,
@@ -176,9 +182,9 @@ class GC_DDPM(nn.Module):
         #         "CrossAttnUpBlock2D",
         #         "CrossAttnUpBlock2D",
         #     ), 
-        #     time_embedding_act_fn="swish"
         # )
 
+        # UNet 초기화 시 time_embedding_type과 차원을 명시적으로 지정
         self.unet = UNet2DConditionModel(
             sample_size=(image_size, max_width),
             in_channels=in_channels,
@@ -197,214 +203,154 @@ class GC_DDPM(nn.Module):
                 "CrossAttnUpBlock2D",
                 "CrossAttnUpBlock2D",
                 "CrossAttnUpBlock2D",
-            ), 
-            time_embedding_act_fn="swish"
+            ),
+            time_embedding_type="positional",  # 명시적으로 positional 지정
+            time_embedding_dim=512,  # 시간 임베딩 차원 명시적 지정
+            projection_class_embeddings_input_dim=None  # 클래스 임베딩 비활성화
         )
-
 
         # self.writer_embedding = nn.Embedding(num_writers, writer_embed_dim)
-        # self.writer_norm = nn.LayerNorm(writer_embed_dim)
+        # self.writer_norm = lambda x: x / torch.norm(x, dim=-1, keepdim=True)
         # self.writer_proj = nn.Linear(writer_embed_dim, writer_embed_dim * 4)
-            # Writer embedding (논문에 명시된 대로)
-        self.writer_embedding = nn.Embedding(num_writers, writer_embed_dim)
-        self.writer_norm = lambda x: x / torch.norm(x, dim=-1, keepdim=True)
-        self.writer_proj = nn.Linear(writer_embed_dim, writer_embed_dim * 4)
-        
-        # DDPM 관련 파라미터 초기화
+
+        # DDPM 관련 파라미터는 제거 (스케줄러가 처리)
         self.n_timesteps = n_timesteps
-        self.register_buffer('betas', torch.linspace(betas[0], betas[1], n_timesteps))
-        self.register_buffer('alphas', 1 - self.betas)
-        self.register_buffer('alphas_cumprod', torch.cumprod(self.alphas, dim=0))
-        
-        # α̅_t-1 계산을 위한 shifted alphas_cumprod
-        alphas_cumprod_prev = torch.cat([torch.ones(1), self.alphas_cumprod[:-1]])
-        self.register_buffer('alphas_cumprod_prev', alphas_cumprod_prev)
-        
-        # β̃_t 계산
-        self.register_buffer('beta_tilde', 
-            self.betas * (1 - self.alphas_cumprod_prev) / (1 - self.alphas_cumprod))
-        
-    def compute_mean(self, x_t, pred_noise, t):
-        alpha_t = self.alphas[t]
-        alpha_t_bar = self.alphas_cumprod[t]
-        
-        mean = (1 / torch.sqrt(alpha_t)) * (
-            x_t - (1 - alpha_t) / torch.sqrt(1 - alpha_t_bar) * pred_noise
-        )
-        return mean
-        
-    def compute_variance(self, var_pred, timesteps):
-        """논문 수식 (6)에 따른 variance 계산"""
-        beta_t = self.betas[timesteps]
-        beta_tilde_t = self.beta_tilde[timesteps]
-        
-        # Σθ(xt, g, w) = exp(νθ(xt, g, w) log βt + (1 - νθ(xt, g, w)) log β̃t)
-        var = torch.exp(
-            var_pred * torch.log(beta_t) + 
-            (1 - var_pred) * torch.log(beta_tilde_t)
-        )
-        return var
-        
-    def forward(self, x, glyph, timesteps, writer_ids=None, use_guidance=False, content_scale=3.0, style_scale=1.0):
-        # 입력 정규화 - clamp 추가
-        x = torch.clamp(x * 2.0 - 1.0, -1.0, 1.0)
-        glyph = torch.clamp(glyph * 2.0 - 1.0, -1.0, 1.0)
-        
-        x_input = torch.cat([x, glyph], dim=1)
-        
-        # 빈 인코더 상태 생성 (재사용)
-        empty_encoder_states = torch.zeros(
-            (x_input.shape[0], 1, self.unet.config.cross_attention_dim),
-            device=x_input.device,
-            dtype=x_input.dtype
-        )
-        
-        if use_guidance:
+
+    def forward(self, x, glyph, timesteps, writer_ids=None, training=True):
+        """학습 시에는 랜덤하게 조건을 null로 설정"""
+        if training:
+            # 10% 확률로 각각 null로 설정
+            use_null_glyph = torch.rand(glyph.shape[0], device=glyph.device) < 0.1
+            use_null_writer = torch.rand(glyph.shape[0], device=glyph.device) < 0.1
+            
+            # Null glyph 처리
             null_glyph = torch.zeros_like(glyph)
-            w_emb = self.writer_embedding(writer_ids)
+            glyph = torch.where(use_null_glyph.view(-1, 1, 1, 1), null_glyph, glyph)
             
-            # writer embedding 정규화에 epsilon 추가
-            w_emb = w_emb / (torch.norm(w_emb, dim=-1, keepdim=True) + 1e-8)
-            w_emb = self.writer_proj(w_emb)
-            
-            # NaN 체크 및 처리
-            if torch.isnan(w_emb).any():
-                w_emb = torch.nan_to_num(w_emb, nan=0.0, posinf=1.0, neginf=-1.0)
-            
-            # 1. Full condition
-            pred_full = self.unet(x_input, timesteps, encoder_hidden_states=w_emb.unsqueeze(1)).sample
-            
-            # 2. Content only
-            pred_content = self.unet(x_input, timesteps, encoder_hidden_states=empty_encoder_states).sample
-            
-            # 3. Style only
-            x_input_style = torch.cat([x, null_glyph], dim=1)
-            pred_style = self.unet(x_input_style, timesteps, encoder_hidden_states=w_emb.unsqueeze(1)).sample
-            
-            # 4. No condition
-            pred_uncond = self.unet(x_input_style, timesteps, encoder_hidden_states=empty_encoder_states).sample
-            
-            # Guidance scale 값 제한
-            content_scale = torch.clamp(torch.tensor(content_scale), -10.0, 10.0)
-            style_scale = torch.clamp(torch.tensor(style_scale), -10.0, 10.0)
-            
-            # Classifier-free guidance 적용
-            noise_pred = (
-                pred_full + 
-                content_scale * pred_content + 
-                style_scale * pred_style - 
-                (content_scale + style_scale) * pred_uncond
-            )
-            
-            # NaN 체크 및 처리
-            noise_pred = torch.nan_to_num(noise_pred, nan=0.0, posinf=1.0, neginf=-1.0)
-            
-            _, var_pred = torch.chunk(pred_full, 2, dim=1)
-            noise_pred, _ = torch.chunk(noise_pred, 2, dim=1)
-            
-        else:
+            # Null writer 처리
             if writer_ids is not None:
-                w_emb = self.writer_embedding(writer_ids)
-                w_emb = w_emb / (torch.norm(w_emb, dim=-1, keepdim=True) + 1e-8)
-                w_emb = self.writer_proj(w_emb)
-                
-                # NaN 체크 및 처리
-                if torch.isnan(w_emb).any():
-                    w_emb = torch.nan_to_num(w_emb, nan=0.0, posinf=1.0, neginf=-1.0)
-                
-                encoder_states = w_emb.unsqueeze(1)
-            else:
-                encoder_states = empty_encoder_states
+                writer_ids = torch.where(use_null_writer, 
+                                    torch.tensor(self.null_writer_id, device=writer_ids.device),
+                                    writer_ids)
             
-            pred = self.unet(x_input, timesteps, encoder_hidden_states=encoder_states).sample
-            noise_pred, var_pred = torch.chunk(pred, 2, dim=1)
+        # 입력 정규화
+        x = x * 2.0 - 1.0
+        glyph = glyph * 2.0 - 1.0
         
-        # 최종 출력값 clamp 및 NaN 처리
-        noise_pred = torch.clamp(noise_pred, -10.0, 10.0)
-        var_pred = torch.clamp(var_pred, -10.0, 10.0)
+        # Writer embedding 처리
+        if writer_ids is not None:
+            # 디버깅을 위한 writer_ids 정보 출력
+            # print(f"writer_ids min: {writer_ids.min()}, max: {writer_ids.max()}, shape: {writer_ids.shape}")
+            # print(f"num_writers: {self.num_writers}")
+            
+            w_emb = self.writer_embedding(writer_ids)
+            w_emb = w_emb / torch.norm(w_emb, dim=-1, keepdim=True)
+            w_emb = self.writer_proj(w_emb)
+            w_emb = w_emb.unsqueeze(1)  # (batch_size, 1, embed_dim)
+        else:
+            w_emb = None
         
-        noise_pred = torch.nan_to_num(noise_pred, nan=0.0, posinf=1.0, neginf=-1.0)
-        var_pred = torch.nan_to_num(var_pred, nan=0.0, posinf=1.0, neginf=-1.0)
+        # 타입과 디바이스 확인
+        x_input = torch.cat([x, glyph], dim=1)
+        x_input = x_input.to(dtype=torch.float32)
+        timesteps = timesteps.to(dtype=torch.long)
+        if w_emb is not None:
+            w_emb = w_emb.to(dtype=torch.float32)
         
-        return noise_pred, var_pred
-
-    def predict_start_from_noise(self, x_t, t, noise):
-        """노이즈로부터 x_0 예측"""
-        alpha_cumprod_t = self.alphas_cumprod[t]
-        return (
-            torch.sqrt(1. / alpha_cumprod_t) * x_t -
-            torch.sqrt(1. / alpha_cumprod_t - 1) * noise
+        # U-Net forward
+        pred = self.unet(
+            sample=x_input,
+            timestep=timesteps,
+            encoder_hidden_states=w_emb,
+            return_dict=True
         )
-
+        
+        return torch.chunk(pred.sample, 2, dim=1)
     @torch.no_grad()
     def ddim_sample(
         self,
         glyph,
         writer_ids,
+        scheduler,
         use_guidance=True,
         content_scale=3.0,
         style_scale=1.0,
         num_inference_steps=50,
-        eta=0.0  # η=0이면 DDIM, η=1이면 DDPM
     ):
-        # device = next(self.parameters()).device
         device = cfg.device
         batch_size = glyph.shape[0]
+        
+        # 모든 입력을 동일한 디바이스로 이동
+        glyph = glyph.to(device)
+        writer_ids = writer_ids.to(device)
         
         # 초기 노이즈에서 시작
         x = torch.randn((batch_size, 1, glyph.shape[2], glyph.shape[3]), device=device)
         
-        # DDIM 타임스텝 시퀀스 생성
-        timesteps = torch.linspace(self.n_timesteps - 1, 0, num_inference_steps, dtype=torch.long, device=device)
+        # 스케줄러의 타임스텝 설정
+        scheduler.set_timesteps(num_inference_steps)
+        timesteps = scheduler.timesteps.to(device)
+        
+        # Null 조건 준비
+        null_glyph = torch.zeros_like(glyph)
+        null_writer_ids = torch.ones_like(writer_ids) * self.num_writers
         
         for i, t in enumerate(tqdm(timesteps, desc="DDIM sampling")):
-            # 다음 타임스텝 계산
-            next_t = timesteps[i + 1] if i < len(timesteps) - 1 else torch.tensor(-1)
+            t_batch = t.expand(batch_size)
             
-            # 현재 타임스텝의 배치 생성
-            t_batch = torch.full((batch_size,), t, device=device, dtype=torch.long)
-            
-            # 노이즈 예측
-            noise_pred, _ = self.forward(
-                x, glyph, t_batch, writer_ids,
-                use_guidance, content_scale, style_scale
-            )
-            
-            # x_0 예측
-            pred_original_sample = self.predict_start_from_noise(x, t, noise_pred)
-            
-            if next_t >= 0:
-                alpha_cumprod_t = self.alphas_cumprod[t]
-                alpha_cumprod_next_t = self.alphas_cumprod[next_t]
+            if use_guidance:
+                # ϵθ(xt, g, w)
+                noise_pred_full, _ = self.forward(x, glyph, t_batch, writer_ids, training=False)
                 
-                # DDIM 업데이트 공식
-                sigma = eta * torch.sqrt(
-                    (1 - alpha_cumprod_next_t) / (1 - alpha_cumprod_t) *
-                    (1 - alpha_cumprod_t / alpha_cumprod_next_t)
+                # ϵθ(xt, g, ∅)
+                noise_pred_no_writer, _ = self.forward(x, glyph, t_batch, null_writer_ids, training=False)
+                
+                # ϵθ(xt, ∅, w)
+                noise_pred_no_glyph, _ = self.forward(x, null_glyph, t_batch, writer_ids, training=False)
+                
+                # ϵθ(xt, ∅, ∅)
+                noise_pred_no_both, _ = self.forward(x, null_glyph, t_batch, null_writer_ids, training=False)
+                
+                # ϵ˜θ(xt, g, w) = ϵθ(xt, g, w) + γϵθ(xt, g, ∅) + ηϵθ(xt, ∅, w) − (γ + η)ϵθ(xt, ∅, ∅)
+                noise_pred = (
+                    noise_pred_full + 
+                    content_scale * noise_pred_no_writer +
+                    style_scale * noise_pred_no_glyph - 
+                    (content_scale + style_scale) * noise_pred_no_both
                 )
-                
-                # 노이즈 샘플링
-                noise = torch.randn_like(x) if eta > 0 else 0.
-                
-                # DDIM 업데이트
-                x = torch.sqrt(alpha_cumprod_next_t) * pred_original_sample + \
-                    torch.sqrt(1 - alpha_cumprod_next_t - sigma ** 2) * noise_pred + \
-                    sigma * noise
             else:
-                # 마지막 스텝
-                x = pred_original_sample
+                # 일반적인 예측
+                noise_pred, _ = self.forward(x, glyph, t_batch, writer_ids, training=False)
+            
+            # 스케줄러를 사용하여 다음 샘플 계산
+            x = scheduler.step(
+                model_output=noise_pred,
+                timestep=t,
+                sample=x,
+            ).prev_sample
         
+        # [-1, 1] 범위를 [0, 1] 범위로 변환
         x = (x + 1) / 2
         return x.clamp(0, 1)
+
     @torch.no_grad()
-    def sample(self, glyph, writer_ids, use_guidance=True, content_scale=3.0, style_scale=1.0, num_inference_steps=50):
-        """기존 sample 메서드를 DDIM을 사용하도록 수정"""
+    def sample(
+        self, 
+        glyph, 
+        writer_ids, 
+        scheduler,
+        use_guidance=True, 
+        content_scale=3.0, 
+        style_scale=1.0, 
+        num_inference_steps=50
+    ):
+        """DDIM 샘플링 메서드"""
         return self.ddim_sample(
             glyph=glyph,
             writer_ids=writer_ids,
+            scheduler=scheduler,
             use_guidance=use_guidance,
             content_scale=content_scale,
             style_scale=style_scale,
             num_inference_steps=num_inference_steps,
-            eta=0.0  # DDIM 사용 (η=0)
         )

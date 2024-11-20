@@ -23,7 +23,7 @@ class IAMDataset(Dataset):
             transforms.ToTensor(),
         ])
         # font 설정 
-        self.font = ImageFont.truetype("DejaVuSans.ttf", self.config.image_size)  # 폰트 크기를 image_size에 맞춤
+        self.font = ImageFont.truetype("NanumGothic.ttf", self.config.image_size)  # 한글 지원 폰트로 변경
         
         # words.txt 파일 읽기
         self.samples = []
@@ -48,7 +48,7 @@ class IAMDataset(Dataset):
                 image_name = parts[0]  # e.g., 'a01-000u-00-00'
                 form_id = '-'.join(image_name.split('-')[:2])  # e.g., 'a01-000u'
                 writer_id = extract_writer_id(form_id)  # e.g., '000u'
-                
+                # print(writer_id)
                 # status가 'ok'인 샘플만 사용
                 if parts[1] != 'ok':
                     continue
@@ -60,7 +60,6 @@ class IAMDataset(Dataset):
                     form_id,
                     f"{image_name}.png"
                 )
-                
                 if not os.path.exists(image_path):
                     continue
                 
@@ -143,6 +142,10 @@ class IAMDataset(Dataset):
         y = 0  # 상단 정렬
         draw.text((x, y), text, font=self.font, fill=0)
 
+        # 글리프 이미지를 파일로 저장
+        glyph_path = os.path.join(self.glyph_dir, f"{text}.png")
+        img.save(glyph_path)
+
         # [0,1] 범위로 변환
         glyph_tensor = self.transform(img)
         self.glyph_cache[text] = glyph_tensor
@@ -177,7 +180,7 @@ if __name__ == "__main__":
     config = IAMTrainingConfig()
     dataset = IAMDataset(config)
 
-    sample = dataset[100]
+    sample = dataset[0]
     images = sample['images'].squeeze(0).numpy()  # (image_size, max_width)
     glyph = sample['glyph'].squeeze(0).numpy()    # (image_size, max_width)
 

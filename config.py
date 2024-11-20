@@ -26,32 +26,42 @@ class TrainingConfig:
     
 @dataclass
 class IAMTrainingConfig:
-    image_size: int = 32
-    max_width: int = 256
-    train_batch_size: int = 4
+    # 데이터 관련 설정
+    image_size: int = 16
+    max_width: int = 128
+    # num_writers: int = 252  # IAM 데이터셋의 작성자 수
+    num_writers: int = 1966  # kor 데이터셋의 작성자 수
+    # data_dir: str = "./data/IAM_words"
+    data_dir: str = "./data/kor_hw"
     
-    
+    # 학습 하이퍼파라미터
     num_epochs: int = 1000
-    num_train_timesteps: int = 1000
+    train_batch_size: int = 16
+    learning_rate: float = 1e-4
+    lr_warmup_steps: int = 100
+    weight_decay: float = 0.01
+    eps: float = 1e-8
+    gradient_accumulation_steps: int = 4
+    mixed_precision: str = "fp16"
     
+    # 디퓨전 모델 파라미터
+    num_train_timesteps: int = 1000
     beta_start: float = 0.0001
     beta_end: float = 0.02
     beta_schedule: str = "linear"
     
-    learning_rate: float = 5e-5
-    lr_warmup_steps: int = 2000
-    
-    mixed_precision: str = "fp16"
-    gradient_accumulation_steps: int = 1
-    
+    # 하드웨어 설정
     device: str = "cuda"
-    gpu_num: int = 3
+    gpu_num: int = 2
     
-    output_dir: str = "./saved_models/241118"
-    num_writers: int = 252  # IAM 데이터셋의 작성자 수
-    
-    data_dir: str = "./data/IAM_words"
-    
+    # 저장 및 체크포인트 설정
+    output_dir: str = "./saved_models/241120_new_kor"
+    save_per_epochs: int = 1
     checkpoint_dir: str = output_dir + "/checkpoints"
-    resume_from_checkpoint = True  # 체크포인트에서 이어서 학습할지 여부
-    checkpoint_name = 'checkpoint_epoch_0.pt'  # 로드할 체크포인트 파일명
+    resume_from_checkpoint = False  # 체크포인트에서 이어서 학습할지 여부
+    checkpoint_name = 'checkpoint_epoch_38.pt'  # 로드할 체크포인트 파일명
+
+    # 샘플링 파라미터
+    num_inference_steps: int = 50
+    content_scale: float = 3.0
+    style_scale: float = 1.0
