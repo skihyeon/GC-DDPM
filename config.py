@@ -59,7 +59,7 @@ class IAMTrainingConfig:
     save_per_epochs: int = 1
     checkpoint_dir: str = output_dir + "/checkpoints"
     resume_from_checkpoint = True  # 체크포인트에서 이어서 학습할지 여부
-    checkpoint_name = 'checkpoint_epoch_7.pt'  # 로드할 체크포인트 파일명
+    checkpoint_name = 'checkpoint_epoch_13.pt'  # 로드할 체크포인트 파일명
 
     # 샘플링 파라미터
     num_inference_steps: int = 10
