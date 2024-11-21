@@ -36,7 +36,7 @@ class IAMTrainingConfig:
     
     # 학습 하이퍼파라미터
     num_epochs: int = 1000
-    train_batch_size: int = 4
+    train_batch_size: int = 16
     learning_rate: float = 1e-4
     lr_warmup_steps: int = 100
     weight_decay: float = 0.01
@@ -62,6 +62,6 @@ class IAMTrainingConfig:
     checkpoint_name = 'checkpoint_epoch_7.pt'  # 로드할 체크포인트 파일명
 
     # 샘플링 파라미터
-    num_inference_steps: int = 50
+    num_inference_steps: int = 10
     content_scale: float = 3.0
     style_scale: float = 1.0

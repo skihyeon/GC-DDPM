@@ -151,7 +151,7 @@ def train(config):
         persistent_workers=True,
         prefetch_factor=2
     )
-    # 스케줄러 설정
+    # 학습용 DDPM 스케줄러
     noise_scheduler = DDPMScheduler(
         num_train_timesteps=config.num_train_timesteps,
         beta_start=config.beta_start,
@@ -160,10 +160,25 @@ def train(config):
         prediction_type="epsilon"
     )
     
+    # 샘플링용 DDIM 스케줄러 - 동일한 베타 스케줄 사용
+    sampling_scheduler = DDIMScheduler(
+        num_train_timesteps=config.num_train_timesteps,
+        beta_start=config.beta_start,
+        beta_end=config.beta_end,
+        beta_schedule=config.beta_schedule,
+        clip_sample=False,
+        prediction_type="epsilon",
+        steps_offset=1  # 중요: DDIM에서 타임스텝 오프셋 설정
+    )
+    
     # 스케줄러의 beta 값들을 GPU로 이동
     noise_scheduler.betas = noise_scheduler.betas.to(config.device)
     noise_scheduler.alphas = noise_scheduler.alphas.to(config.device)
     noise_scheduler.alphas_cumprod = noise_scheduler.alphas_cumprod.to(config.device)
+    
+    sampling_scheduler.betas = sampling_scheduler.betas.to(config.device)
+    sampling_scheduler.alphas = sampling_scheduler.alphas.to(config.device)
+    sampling_scheduler.alphas_cumprod = sampling_scheduler.alphas_cumprod.to(config.device)
     
     # Accelerator 설정을 먼저 하고
     accelerator = Accelerator(
@@ -220,7 +235,7 @@ def train(config):
 
     # 체크포인트 로드 후 샘플 생성
     if config.resume_from_checkpoint and os.path.exists(checkpoint_path):
-        generate_samples(config, start_epoch-1, accelerator.unwrap_model(model), noise_scheduler)
+        generate_samples(config, start_epoch-1, accelerator.unwrap_model(model), sampling_scheduler)
 
     # 학습 루프
     for epoch in range(start_epoch, config.num_epochs):
@@ -245,7 +260,7 @@ def train(config):
         
         # 샘플 생성 및 체크포인트 저장
         if accelerator.is_main_process:
-            generate_samples(config, epoch, accelerator.unwrap_model(model), noise_scheduler)
+            generate_samples(config, epoch, accelerator.unwrap_model(model), sampling_scheduler)
             
 
             if (epoch + 1) % config.save_per_epochs == 0:

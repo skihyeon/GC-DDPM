@@ -267,16 +267,18 @@ class GC_DDPM(nn.Module):
         
         return torch.chunk(pred.sample, 2, dim=1)
     @torch.no_grad()
-    def ddim_sample(
-        self,
-        glyph,
-        writer_ids,
+    def sample(
+        self, 
+        glyph, 
+        writer_ids, 
         scheduler,
-        use_guidance=True,
-        content_scale=3.0,
-        style_scale=1.0,
+        use_guidance=True, 
+        content_scale=3.0, 
+        style_scale=1.0, 
         num_inference_steps=50,
+        eta=0.0  # DDIM 샘플링을 위한 eta 파라미터 추가
     ):
+        """샘플링 메서드 - DDPM 또는 DDIM"""
         device = cfg.device
         batch_size = glyph.shape[0]
         
@@ -295,23 +297,16 @@ class GC_DDPM(nn.Module):
         null_glyph = torch.zeros_like(glyph)
         null_writer_ids = torch.ones_like(writer_ids) * self.num_writers
         
-        for i, t in enumerate(tqdm(timesteps, desc="DDIM sampling")):
+        for i, t in enumerate(tqdm(timesteps, desc="Sampling")):
             t_batch = t.expand(batch_size)
             
             if use_guidance:
-                # ϵθ(xt, g, w)
+                # Classifier-free guidance 계산
                 noise_pred_full, _ = self.forward(x, glyph, t_batch, writer_ids, training=False)
-                
-                # ϵθ(xt, g, ∅)
                 noise_pred_no_writer, _ = self.forward(x, glyph, t_batch, null_writer_ids, training=False)
-                
-                # ϵθ(xt, ∅, w)
                 noise_pred_no_glyph, _ = self.forward(x, null_glyph, t_batch, writer_ids, training=False)
-                
-                # ϵθ(xt, ∅, ∅)
                 noise_pred_no_both, _ = self.forward(x, null_glyph, t_batch, null_writer_ids, training=False)
                 
-                # ϵ˜θ(xt, g, w) = ϵθ(xt, g, w) + γϵθ(xt, g, ∅) + ηϵθ(xt, ∅, w) − (γ + η)ϵθ(xt, ∅, ∅)
                 noise_pred = (
                     noise_pred_full + 
                     content_scale * noise_pred_no_writer +
@@ -319,7 +314,6 @@ class GC_DDPM(nn.Module):
                     (content_scale + style_scale) * noise_pred_no_both
                 )
             else:
-                # 일반적인 예측
                 noise_pred, _ = self.forward(x, glyph, t_batch, writer_ids, training=False)
             
             # 스케줄러를 사용하여 다음 샘플 계산
@@ -327,30 +321,8 @@ class GC_DDPM(nn.Module):
                 model_output=noise_pred,
                 timestep=t,
                 sample=x,
+                eta=eta
             ).prev_sample
         
-        # [-1, 1] 범위를 [0, 1] 범위로 변환
         x = (x + 1) / 2
         return x.clamp(0, 1)
-
-    @torch.no_grad()
-    def sample(
-        self, 
-        glyph, 
-        writer_ids, 
-        scheduler,
-        use_guidance=True, 
-        content_scale=3.0, 
-        style_scale=1.0, 
-        num_inference_steps=50
-    ):
-        """DDIM 샘플링 메서드"""
-        return self.ddim_sample(
-            glyph=glyph,
-            writer_ids=writer_ids,
-            scheduler=scheduler,
-            use_guidance=use_guidance,
-            content_scale=content_scale,
-            style_scale=style_scale,
-            num_inference_steps=num_inference_steps,
-        )
