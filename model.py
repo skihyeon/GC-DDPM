@@ -266,10 +266,10 @@ class GC_DDPM(nn.Module):
             
             if use_guidance:
                 # Classifier-free guidance 계산
-                noise_pred_full, _ = self.forward(x, glyph, t_batch, writer_ids, training=False)
-                noise_pred_no_writer, _ = self.forward(x, glyph, t_batch, null_writer_ids, training=False)
-                noise_pred_no_glyph, _ = self.forward(x, null_glyph, t_batch, writer_ids, training=False)
-                noise_pred_no_both, _ = self.forward(x, null_glyph, t_batch, null_writer_ids, training=False)
+                noise_pred_full, _ = self.forward(x, glyph, t_batch, writer_ids)
+                noise_pred_no_writer, _ = self.forward(x, glyph, t_batch, null_writer_ids)
+                noise_pred_no_glyph, _ = self.forward(x, null_glyph, t_batch, writer_ids)
+                noise_pred_no_both, _ = self.forward(x, null_glyph, t_batch, null_writer_ids)
                 
                 noise_pred = (
                     noise_pred_full + 
@@ -278,7 +278,7 @@ class GC_DDPM(nn.Module):
                     (content_scale + style_scale) * noise_pred_no_both
                 )
             else:
-                noise_pred, _ = self.forward(x, glyph, t_batch, writer_ids, training=False)
+                noise_pred, _ = self.forward(x, glyph, t_batch, writer_ids)
             
             # 스케줄러를 사용하여 다음 샘플 계산
             x = scheduler.step(

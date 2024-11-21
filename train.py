@@ -129,7 +129,6 @@ def train_step(model, batch, noise_scheduler):
         current_glyph, 
         timesteps, 
         current_writer_ids,
-        training=True
     )
     
     # Loss 계산
