@@ -27,8 +27,8 @@ class TrainingConfig:
 @dataclass
 class IAMTrainingConfig:
     # 데이터 관련 설정
-    image_size: int = 16
-    max_width: int = 128
+    image_size: int = 32
+    max_width: int = 256
     # num_writers: int = 252  # IAM 데이터셋의 작성자 수
     num_writers: int = 1966  # kor 데이터셋의 작성자 수
     # data_dir: str = "./data/IAM_words"
@@ -36,7 +36,7 @@ class IAMTrainingConfig:
     
     # 학습 하이퍼파라미터
     num_epochs: int = 1000
-    train_batch_size: int = 16
+    train_batch_size: int = 4
     learning_rate: float = 1e-4
     lr_warmup_steps: int = 100
     weight_decay: float = 0.01
@@ -58,8 +58,8 @@ class IAMTrainingConfig:
     output_dir: str = "./saved_models/241120_new_kor"
     save_per_epochs: int = 1
     checkpoint_dir: str = output_dir + "/checkpoints"
-    resume_from_checkpoint = False  # 체크포인트에서 이어서 학습할지 여부
-    checkpoint_name = 'checkpoint_epoch_38.pt'  # 로드할 체크포인트 파일명
+    resume_from_checkpoint = True  # 체크포인트에서 이어서 학습할지 여부
+    checkpoint_name = 'checkpoint_epoch_7.pt'  # 로드할 체크포인트 파일명
 
     # 샘플링 파라미터
     num_inference_steps: int = 50

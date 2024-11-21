@@ -1,7 +1,7 @@
 import torch
 from hwdataset import IAMDataset
 from model import GC_DDPM
-from diffusers import DDPMScheduler
+from diffusers import DDPMScheduler, DDIMScheduler
 from diffusers.optimization import get_cosine_schedule_with_warmup
 from accelerate import Accelerator
 import os
@@ -100,40 +100,42 @@ def train_step(model, batch, noise_scheduler):
     glyph_images = batch['glyph']
     writer_ids = batch['writer_id']
     
-    # 4가지 조건 조합에 대한 예측 수행
-    total_loss = 0
-    conditions = [
-        (False, False),  # (g, w)
-        (False, True),   # (g, ∅)
-        (True, False),   # (∅, w)
-        (True, True),    # (∅, ∅)
-    ]
+    # 각각 10% 확률로 null 조건 적용
+    batch_size = clean_images.shape[0]
+    use_null_glyph = torch.rand(batch_size, device=clean_images.device) < 0.1
+    use_null_writer = torch.rand(batch_size, device=clean_images.device) < 0.1
     
+    # Null 조건 적용
+    current_glyph = torch.where(
+        use_null_glyph.view(-1, 1, 1, 1),
+        torch.zeros_like(glyph_images),
+        glyph_images
+    )
+    current_writer_ids = torch.where(
+        use_null_writer,
+        torch.ones_like(writer_ids) * model.num_writers,
+        writer_ids
+    )
+    
+    # 노이즈 추가
     noise = torch.randn_like(clean_images)
     timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, 
-                            (clean_images.shape[0],), device=clean_images.device)
+                            (batch_size,), device=clean_images.device)
     noisy_images = noise_scheduler.add_noise(clean_images, noise, timesteps)
     
-    for use_null_glyph, use_null_writer in conditions:
-        # Null 조건 적용
-        current_glyph = torch.zeros_like(glyph_images) if use_null_glyph else glyph_images
-        current_writer_ids = (torch.ones_like(writer_ids) * (model.num_writers) 
-                            if use_null_writer else writer_ids)
-        
-        # 모델 예측
-        noise_pred, var_pred = model(
-            noisy_images, 
-            current_glyph, 
-            timesteps, 
-            current_writer_ids,
-            training=True
-        )
-        
-        # Loss 계산
-        loss = compute_loss(noise_pred, noise, var_pred, timesteps, noise_scheduler)
-        total_loss += loss / len(conditions)
+    # 모델 예측
+    noise_pred, var_pred = model(
+        noisy_images, 
+        current_glyph, 
+        timesteps, 
+        current_writer_ids,
+        training=True
+    )
     
-    return total_loss
+    # Loss 계산
+    loss = compute_loss(noise_pred, noise, var_pred, timesteps, noise_scheduler)
+    
+    return loss
 
 
 
@@ -263,4 +265,11 @@ if __name__ == "__main__":
     os.environ["NCCL_P2P_DISABLE"] = "1"
     os.environ["NCCL_IB_DISABLE"] = "1"
     torch.cuda.set_device(config.gpu_num)
+    
+    print("="*50)
+    print("Configuration:")
+    for k, v in config.__dict__.items():
+        print(f"{k}: {v}")
+    print("="*50)
+    
     train(config)
