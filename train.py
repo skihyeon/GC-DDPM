@@ -9,7 +9,7 @@ from tqdm import tqdm
 import torch.nn.functional as F
 from PIL import Image
 import numpy as np
-from config import IAMTrainingConfig
+from config import TrainingConfig
 import torchvision.transforms as transforms
 
 def generate_samples(config, epoch, model, scheduler):
@@ -273,17 +273,23 @@ def train(config):
                 model_to_save.to(accelerator.device)
 
 if __name__ == "__main__":
-    config = IAMTrainingConfig()
+    from setproctitle import setproctitle
+    setproctitle("Diffusion")
+    
+    config = TrainingConfig()
     os.environ["CUDA_VISIBLE_DEVICES"] = str(config.gpu_num)
     os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
     os.environ["NCCL_P2P_DISABLE"] = "1"
     os.environ["NCCL_IB_DISABLE"] = "1"
     torch.cuda.set_device(config.gpu_num)
     
-    print("="*50)
-    print("Configuration:")
-    for k, v in config.__dict__.items():
-        print(f"{k}: {v}")
-    print("="*50)
+    os.makedirs(config.output_dir, exist_ok=True)
+    config_path = os.path.join(config.output_dir, 'config.txt')
+    with open(config_path, 'w') as f:
+        print("="*50, file=f)
+        print("Configuration:", file=f)
+        for k, v in config.__dict__.items():
+            print(f"{k}: {v}", file=f)
+        print("="*50, file=f)
     
     train(config)

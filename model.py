@@ -4,7 +4,7 @@ from typing import Union, Optional, Dict, Any, Tuple, List
 from diffusers import UNet2DConditionModel, DDIMScheduler, DDPMScheduler
 from diffusers.models.unets.unet_2d_condition import UNet2DConditionOutput
 from tqdm import tqdm
-from config import IAMTrainingConfig as cfg
+from config import TrainingConfig as cfg
 import math
 
 
@@ -131,64 +131,43 @@ class GC_DDPM(nn.Module):
     ) -> None:
         super().__init__()
         
+        # 논문의 classifier-free guidance를 위한 null token 추가
         self.num_writers = num_writers
         self.null_writer_id = num_writers  # null writer ID를 명시적으로 저장
         
-        self.writer_embedding = nn.Embedding(num_writers + 1, writer_embed_dim)  # +1은 null token을 위한 것
+        # writer embedding에 null token 추가 (+1)
+        self.writer_embedding = nn.Embedding(num_writers + 1, writer_embed_dim)
         self.writer_proj = nn.Sequential(
             nn.Linear(writer_embed_dim, writer_embed_dim * 4),
             nn.SiLU(),
             nn.Linear(writer_embed_dim * 4, writer_embed_dim * 4)
         )
 
+        # 논문의 U-Net 구조와 일치
         self.unet = UNet2DConditionModelWithFiLM(
             sample_size=(image_size, max_width),
-            in_channels=in_channels,
+            in_channels=in_channels, 
             out_channels=out_channels,
             layers_per_block=2,
             block_out_channels=(128, 256, 512, 512),
             cross_attention_dim=writer_embed_dim * 4,
             down_block_types=(
                 "CrossAttnDownBlock2D",
-                "CrossAttnDownBlock2D",
+                "CrossAttnDownBlock2D", 
                 "CrossAttnDownBlock2D",
                 "DownBlock2D",
             ),
             up_block_types=(
                 "UpBlock2D",
                 "CrossAttnUpBlock2D",
-                "CrossAttnUpBlock2D",
+                "CrossAttnUpBlock2D", 
                 "CrossAttnUpBlock2D",
             ),
-            time_embedding_type="positional",  # 명시적으로 positional 지정
-            time_embedding_dim=512,  # 시간 임베딩 차원 명시적 지정
-            projection_class_embeddings_input_dim=None,  # 클래스 임베딩 비활성화
-            norm_num_groups = 2
+            time_embedding_type="positional",
+            time_embedding_dim=512,
+            projection_class_embeddings_input_dim=None,
+            norm_num_groups = 2  # 논문의 FiLM layer를 위한 설정
         )
-        
-        # self.unet = UNet2DConditionModel(
-        #     sample_size=(image_size, max_width),
-        #     in_channels=in_channels,
-        #     out_channels=out_channels,
-        #     layers_per_block=2,
-        #     block_out_channels=(128, 256, 512, 512),
-        #     cross_attention_dim=writer_embed_dim * 4,
-        #     down_block_types=(
-        #         "CrossAttnDownBlock2D",
-        #         "CrossAttnDownBlock2D",
-        #         "CrossAttnDownBlock2D",
-        #         "DownBlock2D",
-        #     ),
-        #     up_block_types=(
-        #         "UpBlock2D",
-        #         "CrossAttnUpBlock2D",
-        #         "CrossAttnUpBlock2D",
-        #         "CrossAttnUpBlock2D",
-        #     ),
-        #     time_embedding_type="positional",  # 명시적으로 positional 지정
-        #     time_embedding_dim=512,  # 시간 임베딩 차원 명시적 지정
-        #     projection_class_embeddings_input_dim=None  # 클래스 임베딩 비활성화
-        # )
         
         self.n_timesteps = n_timesteps
 

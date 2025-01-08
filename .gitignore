@@ -10,3 +10,7 @@
 *.jpg
 *.pth
 *.log
+*.webp
+*.txt
+*.csv
+*.pem

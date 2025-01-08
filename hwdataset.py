@@ -1,110 +1,177 @@
+from typing import Dict, Set, List, Any, Optional
 import torch
 from torch.utils.data import Dataset
 from PIL import Image, ImageDraw, ImageFont
 import os
 import numpy as np
 from torchvision import transforms
-from config import IAMTrainingConfig
-
-def extract_writer_id(form_id):
-    """
-    form ID에서 writer ID 추출
-    예: 'a01-000u' -> '000u'
-    """
-    return form_id.split('-')[1]  # '000u'와 같은 전체 ID 반환
+from config import TrainingConfig
 
 class IAMDataset(Dataset):
-    def __init__(self, config: IAMTrainingConfig):
+    def __init__(self, config: TrainingConfig):
+        """
+        IAM 손글씨 데이터셋 초기화
+        
+        Args:
+            config: 학습 설정
+        """
         self.config = config
         self.data_dir = config.data_dir
-        
-        # transform 수정 - [-1,1] 변환 제거 (모델에서 처리)
+        self._setup_transforms()
+        self._setup_font()
+        self._load_dataset()
+        self._setup_glyph_cache()
+        self._save_writer_ids()
+
+    def _setup_transforms(self) -> None:
+        """이미지 변환 설정"""
         self.transform = transforms.Compose([
             transforms.ToTensor(),
         ])
-        # font 설정 
-        self.font = ImageFont.truetype("NanumGothic.ttf", self.config.image_size)  # 한글 지원 폰트로 변경
         
-        # words.txt 파일 읽기
-        self.samples = []
-        self.writer_ids = set()  # unique writer IDs
+        # 논문에 따라 이미지 크기 조정
+        self.image_size = self.config.image_size  # 64
+        self.max_width = self.config.max_width    # 512
+
+    def _setup_font(self) -> None:
+        """폰트 설정"""
+        try:
+            self.font = ImageFont.truetype("NanumGothic.ttf", self.config.image_size)
+        except OSError:
+            raise RuntimeError("NanumGothic.ttf 폰트를 찾을 수 없습니다.")
+
+    def _is_valid_text(self, text: str) -> bool:
+        """텍스트 유효성 검사"""
+        if len(text.strip()) < 2:
+            return False
+        if any(char in text for char in ['/', '.', '_']):
+            return False
+        return True
+
+    def _parse_line(self, line: str) -> Optional[Dict[str, Any]]:
+        """words.txt 파일의 한 줄을 파싱"""
+        parts = line.strip().split()
+        if len(parts) < 9:
+            return None
+            
+        text = ' '.join(parts[8:])
+        if not self._is_valid_text(text):
+            return None
+            
+        image_name = parts[0]
+        form_id = '-'.join(image_name.split('-')[:2])
+        writer_id = self._extract_writer_id(form_id)
+        
+        if parts[1] != 'ok':
+            return None
+            
+        image_path = self._get_image_path(form_id, image_name)
+        if not os.path.exists(image_path):
+            return None
+            
+        return {
+            'image_name': image_name,
+            'writer_id': writer_id,
+            'text': text,
+            'bbox': [int(x) for x in parts[3:7]]
+        }
+
+    def _load_dataset(self) -> None:
+        """데이터셋 로드"""
+        self.samples: List[Dict[str, Any]] = []
+        self.writer_ids: Set[str] = set()
         words_file = os.path.join(self.data_dir, 'words.txt')
+        
+        if not os.path.exists(words_file):
+            raise FileNotFoundError(f"words.txt 파일을 찾을 수 없습니다: {words_file}")
         
         with open(words_file, 'r') as f:
             for line in f:
-                # 주석 라인 건너뛰기
                 if line.startswith('#'):
                     continue
                     
-                parts = line.strip().split()
-                if len(parts) < 9:  # 최소 필요한 필드 수 확인
-                    continue
-                
-                # 텍스트 추출 및 길이 체크
-                text = ' '.join(parts[8:])  # transcription
-                if len(text.strip()) < 2:  # 두 글자 미만 건너뛰기
-                    continue
-                    
-                image_name = parts[0]  # e.g., 'a01-000u-00-00'
-                form_id = '-'.join(image_name.split('-')[:2])  # e.g., 'a01-000u'
-                writer_id = extract_writer_id(form_id)  # e.g., '000u'
-                # print(writer_id)
-                # status가 'ok'인 샘플만 사용
-                if parts[1] != 'ok':
-                    continue
-                
-                image_path = os.path.join(
-                    self.data_dir, 
-                    'words',
-                    form_id.split('-')[0],
-                    form_id,
-                    f"{image_name}.png"
-                )
-                if not os.path.exists(image_path):
-                    continue
-                
-                self.writer_ids.add(writer_id)
-                self.samples.append({
-                    'image_name': image_name,
-                    'writer_id': writer_id,
-                    'text': text,
-                    'bbox': [int(x) for x in parts[3:7]]
-                })
+                sample = self._parse_line(line)
+                if sample:
+                    self.writer_ids.add(sample['writer_id'])
+                    self.samples.append(sample)
         
-        # writer ID를 숫자 인덱스로 매핑 (정렬하여 일관된 인덱스 보장)
         self.writer_id_to_idx = {wid: idx for idx, wid in enumerate(sorted(self.writer_ids))}
-        print(f"Total unique writers: {len(self.writer_ids)}")
-        print(f"Total samples: {len(self.samples)}")
+        print(f"총 작성자 수: {len(self.writer_ids)}")
+        print(f"총 샘플 수: {len(self.samples)}")
 
-        # Glyph 이미지 사전 로드 (효율성을 위해 캐싱)
+    def _setup_glyph_cache(self) -> None:
+        """글리프 캐시 설정"""
         self.glyph_dir = os.path.join(self.data_dir, 'glyphs')
         os.makedirs(self.glyph_dir, exist_ok=True)
-        self.glyph_cache = {}
-        
-        # # writer ID 목록 파일 저장 (샘플 생성시 필요)
-        # with open(os.path.join(self.data_dir, 'writer_ids.txt'), 'w') as f:
-        #     for wid in sorted(self.writer_ids):
-        #         f.write(f"{wid}\n")
-                
-    def __getitem__(self, idx):
-        sample = self.samples[idx]
-        
-        # 이미지 경로 구성
-        # words/a01/a01-000u/a01-000u-00-00.png
-        form_id = '-'.join(sample['image_name'].split('-')[:2])
-        image_path = os.path.join(
+        self.glyph_cache: Dict[str, torch.Tensor] = {}
+
+    def _save_writer_ids(self) -> None:
+        """작성자 ID 목록 저장"""
+        writer_ids_path = os.path.join(self.data_dir, 'writer_ids.txt')
+        with open(writer_ids_path, 'w') as f:
+            for wid in sorted(self.writer_ids):
+                f.write(f"{wid}\n")
+
+    @staticmethod
+    def _extract_writer_id(form_id: str) -> str:
+        """form ID에서 writer ID 추출"""
+        return form_id.split('-')[1]
+
+    def _get_image_path(self, form_id: str, image_name: str) -> str:
+        """이미지 경로 생성"""
+        return os.path.join(
             self.data_dir, 
             'words',
-            form_id.split('-')[0],  # 'a01'
-            form_id,                # 'a01-000u'
-            f"{sample['image_name']}.png"
+            form_id.split('-')[0],
+            form_id,
+            f"{image_name}.png"
         )
+
+    def create_glyph_image(self, text: str) -> torch.Tensor:
+        """텍스트를 글리프 이미지로 변환"""
+        if text in self.glyph_cache:
+            return self.glyph_cache[text]
+
+        img = Image.new('L', (self.config.max_width, self.config.image_size), color=255)
+        draw = ImageDraw.Draw(img)
+
+        text_width = draw.textlength(text, font=self.font)
+        x = (self.config.max_width - text_width) // 2
+        draw.text((x, 0), text, font=self.font, fill=0)
+
+        glyph_path = os.path.join(self.glyph_dir, f"{text}.png")
+        img.save(glyph_path)
+
+        glyph_tensor = self.transform(img)
+        self.glyph_cache[text] = glyph_tensor
+        return glyph_tensor
+
+    def process_handwritten_image(self, image_path: str) -> torch.Tensor:
+        """손글씨 이미지 전처리"""
+        try:
+            img = Image.open(image_path).convert('L')
+        except Exception as e:
+            raise RuntimeError(f"이미지 로드 실패: {image_path}, 에러: {str(e)}")
+
+        aspect_ratio = min(img.size[0] / img.size[1], 8.0)
+        new_width = int(self.config.image_size * aspect_ratio)
+        img = img.resize((new_width, self.config.image_size), Image.LANCZOS)
+
+        padded_img = Image.new('L', (self.config.max_width, self.config.image_size), color=255)
+        x_offset = (self.config.max_width - new_width) // 2
+        padded_img.paste(img, (x_offset, 0))
+
+        return self.transform(padded_img)
+
+    def __getitem__(self, idx: int) -> Dict[str, Any]:
+        """데이터셋 아이템 반환"""
+        sample = self.samples[idx]
+        form_id = '-'.join(sample['image_name'].split('-')[:2])
+        image_path = self._get_image_path(form_id, sample['image_name'])
         
-        # 이미지 로드 및 전처리
         image = self.process_handwritten_image(image_path)
         glyph = self.create_glyph_image(sample['text'])
         
-        # 이미지와 글리프의 크기를 동일하게 맞춤
         if image.shape != glyph.shape:
             glyph = torch.nn.functional.interpolate(
                 glyph.unsqueeze(0), 
@@ -113,78 +180,27 @@ class IAMDataset(Dataset):
                 align_corners=False
             ).squeeze(0)
         
-        # 모든 이미지가 [0,1] 범위를 유지하도록 함
         return {
-            'images': image,        # (1, image_size, max_width) in [0,1]
-            'glyph': glyph,         # (1, image_size, max_width) in [0,1]
+            'images': image,
+            'glyph': glyph,
             'writer_id': torch.tensor(self.writer_id_to_idx[sample['writer_id']], dtype=torch.long),
             'text': sample['text']
         }
 
-    def __len__(self):
+    def __len__(self) -> int:
+        """데이터셋 길이 반환"""
         return len(self.samples)
-    
-    def create_glyph_image(self, text):
-        """텍스트를 글리프 이미지로 변환"""
-        # 캐시에서 확인
-        if text in self.glyph_cache:
-            return self.glyph_cache[text]
-
-        # 새로운 글리프 이미지 생성
-        img = Image.new('L', (self.config.max_width, self.config.image_size), color=255)
-        draw = ImageDraw.Draw(img)
-
-        # 텍스트 크기 측정
-        text_width = draw.textlength(text, font=self.font)
-
-        # 텍스트 중앙 정렬
-        x = (self.config.max_width - text_width) // 2
-        y = 0  # 상단 정렬
-        draw.text((x, y), text, font=self.font, fill=0)
-
-        # 글리프 이미지를 파일로 저장
-        glyph_path = os.path.join(self.glyph_dir, f"{text}.png")
-        img.save(glyph_path)
-
-        # [0,1] 범위로 변환
-        glyph_tensor = self.transform(img)
-        self.glyph_cache[text] = glyph_tensor
-        return glyph_tensor
-    
-    def process_handwritten_image(self, image_path):
-        """손글씨 이미지 전처리"""
-        img = Image.open(image_path).convert('L')
-
-        # 높이를 image_size로 조정하면서 최대 aspect ratio 8 유지
-        aspect_ratio = min(img.size[0] / img.size[1], 8.0)
-        new_width = int(self.config.image_size * aspect_ratio)
-        img = img.resize((new_width, self.config.image_size), Image.LANCZOS)
-
-        # max_width에 맞춰 패딩 (양쪽 마진에 흰색 패딩)
-        padded_img = Image.new('L', (self.config.max_width, self.config.image_size), color=255)
-        x_offset = (self.config.max_width - new_width) // 2
-        padded_img.paste(img, (x_offset, 0))
-
-        # [0,1] 범위로 변환
-        return self.transform(padded_img)
-
-    
-
 
 if __name__ == "__main__":
-    # 예시: 데이터셋 샘플 시각화
     import matplotlib.pyplot as plt
-    from hwdataset import IAMDataset
-    from config import IAMTrainingConfig
 
-    config = IAMTrainingConfig()
+    config = TrainingConfig()
     dataset = IAMDataset(config)
 
     sample = dataset[0]
-    images = sample['images'].squeeze(0).numpy()  # (image_size, max_width)
-    glyph = sample['glyph'].squeeze(0).numpy()    # (image_size, max_width)
-
-    combined = np.concatenate([images, glyph], axis=1)  # 채널 차원에서 결합한 모습
+    images = sample['images'].squeeze(0).numpy()
+    glyph = sample['glyph'].squeeze(0).numpy()
+    combined = np.concatenate([images, glyph], axis=1)
 
     plt.imshow(combined, cmap='gray')
     plt.title(f"Writer ID: {sample['writer_id']}, Text: {sample['text']}")
